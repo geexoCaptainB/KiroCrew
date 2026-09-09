@@ -281,6 +281,7 @@ class EvalRunner:
             # SessionManager uses shared_ws_factory so consolidation sessions
             # also target the shared workspace.
             session_mgr = SessionManager(config, shared_ws_factory)
+            await asyncio.to_thread(session_mgr.reclaim_adopted_transcripts)
             await session_mgr.start_pool()
 
             consolidator = HistoryConsolidator(

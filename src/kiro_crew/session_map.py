@@ -8,10 +8,14 @@ generic ChannelLink mirror map) for bidirectional sync.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import errno
 import functools
 import json
 import logging
 import os
+import shutil
+import stat
 import tempfile
 import threading
 from collections.abc import Callable, Iterator
@@ -20,7 +24,14 @@ from pathlib import Path
 from typing import ParamSpec, TypeVar
 
 from kiro_crew.acp.types import PROVIDER_LABEL_DEFAULT
-from kiro_crew.config.paths import config_dir, kiro_sessions_dir
+from kiro_crew.atomic_write import fsync_dir
+from kiro_crew.config.paths import (
+    config_dir,
+    default_kiro_home,
+    foreign_data_home,
+    isolated_kiro_home,
+    kiro_sessions_dir,
+)
 from kiro_crew.messaging.link import (
     SLACK_NAMESPACE,
     UNBIND_REASON_ENTRY_DELETED,
@@ -55,6 +66,223 @@ _KIRO_SESSIONS_DIR: Path | None = None
 def _kiro_sessions_dir() -> Path:
     """kiro-cli sessions directory, resolved against the live data home."""
     return _KIRO_SESSIONS_DIR if _KIRO_SESSIONS_DIR is not None else kiro_sessions_dir()
+
+
+def _adopted_transcript_source() -> Path | None:
+    """Return the host transcript dir while this process uses an adopted home."""
+    own_home = foreign_data_home()
+    if own_home is None:
+        return None
+    if os.environ.get("KIRO_HOME", "") != str(isolated_kiro_home(own_home)):
+        return None
+    return default_kiro_home() / "sessions" / "cli"
+
+
+def _source_may_hold_transcript(path: Path) -> bool:
+    """Fail closed when a source transcript exists or cannot be inspected."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except ValueError:
+        # An invalid pathname (embedded NUL from a corrupt map row) can hold no
+        # transcript; ``exists()`` reads it as absent, so this fence must too
+        # rather than aborting the caller's whole pass.
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _pending_in_host_dir(source: Path | None, sid: object) -> bool:
+    """True while an adopted-home sid's transcript still sits host-side.
+
+    The shared fence for every stale check (:meth:`SessionMap.get` and
+    :meth:`SessionMap.prune`): gateway reclamation starts after READY and after
+    the pool's initial prune, so until the move lands a host-side file is a live
+    transcript, not stale state. Failed moves leave that same witness in place,
+    so the mapping survives and the next start retries. Fails closed when the
+    source cannot be inspected; a sid that is not a plain file name never
+    matches (no traversal out of the host dir).
+    """
+    return (
+        source is not None
+        and isinstance(sid, str)
+        and bool(sid)
+        and Path(sid).name == sid
+        and _source_may_hold_transcript(source / f"{sid}.json")
+    )
+
+
+def _link_free_dir(root: Path, target: Path) -> Path | None:
+    """Create ``target`` under ``root`` and answer the first symlinked component, else ``None``.
+
+    Every component from ``root`` itself down to ``target`` is judged by
+    ``lstat`` (``is_symlink``), never by resolving the string: ``root`` is
+    checked first -- a link planted AT the root (``<data home>/kiro`` pointing
+    elsewhere) would otherwise pass a walk that only inspects the components
+    below it -- then each component under it; a missing component is not a
+    link, and a ``target`` that does not sit under ``root`` at all is answered
+    as ``target`` itself so the caller refuses it the same way. Checked once
+    before ``mkdir`` -- ``mkdir(parents=True, exist_ok=True)`` walks THROUGH a
+    symlinked parent and creates the leaf wherever it points -- and once after,
+    when every component exists. This is a check, not a lock: a component
+    swapped for a link between the second walk and the move is a residual
+    window this call does not close; the leaf itself is guarded by the
+    ``O_CREAT | O_EXCL`` publish in :func:`_move_transcript_no_follow`, which
+    has no such window.
+    """
+
+    def _first_link() -> Path | None:
+        if root.is_symlink():
+            return root
+        try:
+            rel = target.relative_to(root)
+        except ValueError:
+            return target
+        cur = root
+        for part in rel.parts:
+            cur = cur / part
+            if cur.is_symlink():
+                return cur
+        return None
+
+    linked = _first_link()
+    if linked is not None:
+        return linked
+    target.mkdir(parents=True, exist_ok=True)
+    return _first_link()
+
+
+class _SourceRefused(OSError):
+    """The source of a transcript move is not a plain regular file (a symlink, a
+    FIFO, a directory) or changed identity between being looked at and being
+    opened; the file is left untouched and nothing is copied."""
+
+
+def _open_regular_file_no_follow(src: Path) -> int:
+    """Open ``src`` for reading without following a link and prove what was opened.
+
+    Returns a descriptor on a regular file, or raises :class:`_SourceRefused`.
+    ``lstat`` first refuses a symlink or special file by name; the open then
+    carries ``O_NOFOLLOW`` so a link swapped in after that look fails its own
+    open (``ELOOP``) instead of being read through; ``fstat`` on the descriptor
+    confirms a regular file with the same device and inode the ``lstat`` saw, so
+    the bytes copied are those of the file that was inspected. Where
+    ``O_NOFOLLOW`` does not exist (Windows) the open follows a link, and the
+    ``fstat``/``lstat`` identity check is what catches a swap -- a residual
+    look/open window on that platform, stated rather than closed.
+
+    A source with more than one hard link is NOT refused: the reader of this
+    directory is the same user who could read the linked file anyway, and
+    hard-link snapshot tools (``rsync --link-dest`` and kin) leave every file in a
+    home directory multiply linked -- refusing them would strand every transcript
+    of that install.
+    """
+    try:
+        before = os.lstat(src)
+    except OSError as exc:
+        raise _SourceRefused(exc.errno, f"cannot inspect {src.name}: {exc.strerror}") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise _SourceRefused(errno.EINVAL, f"{src.name} is not a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(src, flags)
+    except OSError as exc:
+        raise _SourceRefused(exc.errno, f"cannot open {src.name}: {exc.strerror}") from exc
+    try:
+        after = os.fstat(fd)
+        if not stat.S_ISREG(after.st_mode):
+            raise _SourceRefused(errno.EINVAL, f"{src.name} is not a regular file")
+        if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+            raise _SourceRefused(errno.EINVAL, f"{src.name} changed while being opened")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _fsync_transcript_destination_dir(path: Path) -> None:
+    """Persist a published destination name before its source can be removed.
+
+    Delegates to :func:`kiro_crew.atomic_write.fsync_dir`, which is quiet where
+    a directory sync cannot be expressed -- Windows, and filesystems (network
+    mounts in particular) whose ``fsync`` on a directory returns ``EINVAL`` and
+    kin -- and raises real write errors like ``EIO``, so the caller removes the
+    destination and keeps the source for a retry. A bespoke raise-on-everything
+    helper here would turn "this filesystem cannot sync a directory" into a
+    failed migration on every start, and the prune that follows would drop the
+    un-migrated mappings -- the silent session loss this module exists to avoid.
+    """
+    fsync_dir(path)
+
+
+def _move_transcript_no_follow(src: Path, dst: Path) -> None:
+    """Move ``src`` to ``dst`` reading only a verified regular file and never
+    following or overwriting anything at ``dst``.
+
+    The bytes are read from the descriptor :func:`_open_regular_file_no_follow`
+    validated -- not from the path again -- into a descriptor opened at ``dst``
+    with ``O_CREAT | O_EXCL`` (plus ``O_NOFOLLOW`` where it exists), which
+    creates the name in the same call that refuses whatever already holds it --
+    a dangling symlink included, without following it -- then fsynced. On
+    Windows, where the exclusive create would judge existence THROUGH a
+    reparse point, a preceding ``lstat`` refuses a link at ``dst`` first. A
+    path-based ``os.link``/``rename`` publish is deliberately not used: a
+    hard-link step would fail with ``OSError`` on a filesystem without hard-link
+    support (exFAT and kin), and the caller's skip-and-log branch would then
+    let the prune that follows read the un-migrated transcript as gone and drop
+    the mapping -- a whole class of homes silently losing their sessions. The
+    ``O_EXCL`` create needs no filesystem feature beyond the directory itself.
+    ``src`` is unlinked only once ``dst`` is the complete file and, on POSIX,
+    its directory entry has been fsynced where the filesystem can express that
+    (a directory ``fsync`` some filesystems -- network mounts in particular --
+    reject; those keep the smaller power-loss residual instead of failing the
+    migration). Windows exposes no equivalent directory-descriptor barrier
+    through :mod:`os`, so that platform retains the
+    previous power-loss window between destination close and source unlink. On
+    every failure after the create, the partial ``dst`` is removed and ``src`` is
+    left in place; ``FileExistsError`` means something already held the name
+    (nothing is removed then -- it was never ours),
+    :class:`_SourceRefused` that the source was not a plain file.
+    """
+    fd = _open_regular_file_no_follow(src)
+    try:
+        # ``O_CREAT | O_EXCL`` refuses whatever holds the name on POSIX -- a
+        # dangling symlink included -- but Windows has no ``O_NOFOLLOW`` and
+        # its exclusive create judges existence THROUGH a reparse point, so a
+        # dangling link at ``dst`` would be followed and the file created at
+        # the link's target. Refused by ``lstat`` first; the look/open window
+        # this leaves on Windows is the same stated residual as in
+        # :func:`_open_regular_file_no_follow` (POSIX has none: the open
+        # itself refuses the link).
+        if dst.is_symlink():
+            raise FileExistsError(errno.EEXIST, f"{dst.name} is held by a symlink")
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        out_fd = os.open(dst, flags, 0o600)
+        try:
+            with os.fdopen(out_fd, "wb") as out:
+                out_fd = -1  # owned by ``out`` now
+                with os.fdopen(fd, "rb") as inp:
+                    fd = -1  # owned by ``inp`` now
+                    shutil.copyfileobj(inp, out)
+                    out.flush()
+                    os.fsync(out.fileno())
+            _fsync_transcript_destination_dir(dst.parent)
+        except BaseException:
+            if out_fd >= 0:
+                os.close(out_fd)
+            # The create above succeeded, so the name is ours: remove the
+            # partial file so the next start retries from the source.
+            with contextlib.suppress(OSError):
+                os.unlink(dst)
+            raise
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    os.unlink(src)
 
 
 # Per-conversation flag recording a refusal of automatic origin mirroring. Named
@@ -791,6 +1019,15 @@ class SessionMap:
                 self._repair_or_remove_stale(matched_key)
                 return None
             return sid
+        if _pending_in_host_dir(_adopted_transcript_source(), sid):
+            # A request-driven get() can land between READY and the post-READY
+            # reclamation (or after a failed move). Repairing here would orphan
+            # the host-side transcript, so keep the sid: the move usually lands
+            # within seconds and resume then works. A resume attempted inside
+            # the window falls back to a new session (session/load requires the
+            # adopted-dir file) exactly as it did without this fence — but the
+            # mapping and host files survive for callers that only read the sid.
+            return sid
         if sid:
             self._repair_or_remove_stale(matched_key)
         return None
@@ -1005,6 +1242,122 @@ class SessionMap:
         self._remove_entry(canonical_key(key), reason=reason)
 
     @_guarded
+    def reclaim_adopted_transcripts(self) -> int:
+        """Move this map's transcripts from the host ``~/.kiro`` into an adopted kiro home.
+
+        An install that already ran on a non-default ``KIROCREW_HOME`` wrote its
+        kiro-cli transcripts under the machine-wide ``~/.kiro/sessions/cli``; once
+        the CLI prologue gives that install its own kiro home
+        (``config.paths.adopt_isolated_kiro_home``), ``kiro_sessions_dir()`` names
+        a directory nothing has written yet. Left there, the very next
+        :meth:`prune` would read every mapped transcript as gone and drop the
+        mapping, while the files sat one directory over. One-shot entry points move
+        them before their first prune; the gateway's initial prune instead treats
+        the host-side transcript as live, then this migration runs after READY.
+        Each mapped ``<sid>.json`` transcript and ``<sid>.jsonl`` journal that
+        exists only in the host directory moves into the adopted home.
+
+        Only THIS instance's files move: the host directory is shared with the
+        default instance, and the map is the authoritative list of which sessions
+        are ours. Nothing is copied, deleted or rewritten beyond that move, and
+        nothing runs unless the kiro home in force IS the adopted one -- the
+        ``KIRO_HOME=~/.kiro`` opt-out, a pod, the CI harness and every default-home
+        install return before touching the host directory. And the files move
+        only INTO this instance's kiro home, and only plain files move: the
+        destination directory is refused if any component of it is a symlink
+        (:func:`_link_free_dir`), and each file is placed by
+        :func:`_move_transcript_no_follow`, which reads only a descriptor proven
+        to be the regular file it looked at and never follows or replaces
+        whatever already holds the destination name -- a link planted under a
+        mapped sid on the host side is not read through, and a link planted in
+        the data home cannot redirect a transcript out of it.
+        Idempotent and resumable: each file is moved only while it is still on
+        the host side and absent from the target, the transcript before the
+        journal, so a move that fails halfway is retried on the next start
+        instead of being read as done. Returns the number of sessions with at
+        least one file moved; a failure to move one file is logged and skipped,
+        never fatal, because a startup path must not die on a permissions quirk
+        in a directory it does not own.
+        """
+        source = _adopted_transcript_source()
+        if source is None:
+            return 0
+        target = _kiro_sessions_dir()
+        try:
+            if not source.is_dir() or source.resolve() == target.resolve():
+                return 0
+        except (OSError, RuntimeError):
+            return 0
+        own_home = foreign_data_home()
+        if own_home is None:  # narrowed by _adopted_transcript_source; fail closed on env churn
+            return 0
+        own_root = isolated_kiro_home(own_home)
+        moved = 0
+        for entry in self._data.values():
+            if (entry.get("provider") or PROVIDER_LABEL_DEFAULT) != PROVIDER_LABEL_DEFAULT:
+                continue
+            sid = entry.get("sid")
+            # A sid is a filename here; the map is ours, but a value with a
+            # separator in it would otherwise walk out of the directory.
+            if not sid or not isinstance(sid, str) or Path(sid).name != sid:
+                continue
+            # Per file, transcript first: the transcript is what ``prune`` looks
+            # for, and ``prune`` runs later in this same startup. With the
+            # transcript already across, a move that dies before the journal
+            # leaves an entry ``prune`` keeps, and the next start moves exactly
+            # the file that is still on the host side. The other order would let
+            # that prune drop the mapping while the transcript sat on the host.
+            # (``get`` also wants the journal, so a resume of that one session
+            # inside the window still reads it as stale; the next start heals it.)
+            moved_here = False
+            for suffix in (".json", ".jsonl"):
+                src = source / f"{sid}{suffix}"
+                dst = target / f"{sid}{suffix}"
+                if not src.is_file() or dst.exists():
+                    continue
+                try:
+                    # The destination must be a real directory inside this
+                    # instance's kiro home: a symlinked component would carry
+                    # the whole migration wherever the link points, so the
+                    # run stops here with every file still on the host side.
+                    linked = _link_free_dir(own_root, target)
+                    if linked is not None:
+                        logger.warning(
+                            "Not moving session transcripts into %s: %s is a symlink, "
+                            "so the files would leave this instance's kiro home %s",
+                            target,
+                            linked,
+                            own_root,
+                        )
+                        return moved
+                    _move_transcript_no_follow(src, dst)
+                    moved_here = True
+                except FileExistsError:
+                    # ``exists()`` said no a moment ago, so what holds the name
+                    # is a dangling link or a file that appeared since. Neither
+                    # is followed or replaced; the source stays where it is.
+                    logger.warning(
+                        "Not moving %s into %s: something already holds that name", src.name, target
+                    )
+                except _SourceRefused as exc:
+                    # Not a plain file on the host side (a link planted under a
+                    # mapped sid, a FIFO), or one that changed while being
+                    # opened: nothing was read through it and it stays as is.
+                    logger.warning("Not moving %s into %s: %s", src.name, target, exc.strerror)
+                except OSError as exc:
+                    logger.warning("Could not move %s into %s: %s", src.name, target, exc)
+            if moved_here:
+                moved += 1
+        if moved:
+            logger.info(
+                "Moved %d session transcript(s) from %s into this instance's kiro home %s",
+                moved,
+                source,
+                target,
+            )
+        return moved
+
+    @_guarded
     def prune(self) -> int:
         """Remove entries whose session files no longer exist.
 
@@ -1043,6 +1396,7 @@ class SessionMap:
         does.
         """
         sessions_dir = _kiro_sessions_dir()
+        adopted_source = _adopted_transcript_source()
         stale: list[str] = []
         repaired = False
         for key, entry in self._data.items():
@@ -1052,7 +1406,12 @@ class SessionMap:
                 continue
             sid = entry.get("sid")
             survives = _survives_prune(entry)
-            if sid and not (sessions_dir / f"{sid}.json").exists():
+            target_missing = bool(sid) and not (sessions_dir / f"{sid}.json").exists()
+            if target_missing and _pending_in_host_dir(adopted_source, sid):
+                # See _pending_in_host_dir: the host-side file is a live
+                # transcript awaiting the post-READY move, never stale state.
+                continue
+            if target_missing:
                 if survives:
                     entry["sid"] = ""
                     repaired = True

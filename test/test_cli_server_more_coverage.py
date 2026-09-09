@@ -910,8 +910,13 @@ class _FakeVectorStore(_FakeStore):
 class _FakeSessions:
     def __init__(self, cfg, provider_factory=None) -> None:
         self.cfg = cfg
+        self.reclaimed = False
         self.pool_started = False
         self.closed = False
+
+    def reclaim_adopted_transcripts(self) -> int:
+        self.reclaimed = True
+        return 0
 
     async def start_pool(self) -> None:
         self.pool_started = True
@@ -1012,6 +1017,7 @@ class TestRunTask:
         assert kw["fresh"] is False
         assert kw["global_timeout"] == 90.0
         assert taskrunner_env["ran"] == (spec.resolve(), "my-run")
+        assert taskrunner_env["sessions"].reclaimed is True
         assert taskrunner_env["sessions"].pool_started is True
         assert taskrunner_env["sessions"].closed is True
         assert taskrunner_env["observed"]  # skill-read observer registered

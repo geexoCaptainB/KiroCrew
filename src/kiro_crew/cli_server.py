@@ -2417,6 +2417,7 @@ async def _run_task(args: argparse.Namespace) -> None:
     cfg = KiroCrewConfig.load()
     factory = build_provider_factory(cfg)
     sessions = SessionManager(cfg, provider_factory=factory)  # type: ignore[arg-type]
+    await asyncio.to_thread(sessions.reclaim_adopted_transcripts)
 
     auto_test = not getattr(args, "no_test", False)
     fresh = getattr(args, "fresh", False)

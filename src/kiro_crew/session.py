@@ -1801,6 +1801,17 @@ class SessionManager:
             name="SessionManager",
         )
 
+    def reclaim_adopted_transcripts(self) -> int:
+        """Move adopted-home transcripts without exposing their map rows to prune.
+
+        This is synchronous file I/O, including copy and durability barriers.
+        One-shot async entry points await it through :func:`asyncio.to_thread`.
+        The gateway defers that offload until after READY and its initial prune;
+        :class:`SessionMap` treats source-side adopted transcripts as live until
+        the move succeeds, so the deferred ordering cannot discard a mapping.
+        """
+        return self._session_map.reclaim_adopted_transcripts()
+
     def _ensure_cleanup_task(self) -> None:
         """Start the one cleanup loop at the allocation registration point."""
         self._cleanup_boundary().start_cleanup()

@@ -13485,12 +13485,22 @@ class GatewayOrchestrator:
         async def _start_bg_session() -> None:
             try:
                 assert self.sessions is not None
+                # ``start_pool`` performs the initial prune. SessionMap treats a
+                # host-side adopted transcript as live, so this ordering is safe
+                # while keeping file-count-scaled migration off the READY path.
                 await self.sessions.start_pool(blocking=False)
                 logger.info("Background session starting")
             except Exception:
                 logger.warning("Background session start failed", exc_info=True)
+                return
+            try:
+                await asyncio.to_thread(self.sessions.reclaim_adopted_transcripts)
+            except Exception:
+                logger.warning("Adopted transcript reclaim failed", exc_info=True)
 
-        asyncio.create_task(_start_bg_session())
+        _bg_session_task = asyncio.create_task(_start_bg_session())
+        self._background_tasks.add(_bg_session_task)
+        _bg_session_task.add_done_callback(self._background_tasks.discard)
 
         # Stale-asset watchdog: detects when an update prunes the running
         # install's static assets and triggers graceful shutdown so the
