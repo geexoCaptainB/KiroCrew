@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import ast
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from kiro_crew import pinned_fs
+from kiro_crew import skills as skills_mod
 from kiro_crew.dashboard.handlers import prompts as H
-from kiro_crew.skills import AutoSkillProvenance, SkillsLoader
+from kiro_crew.skills import AutoSkillProvenance, PendingApprovalRefused, SkillsLoader
 
 _OMITTED = object()
 
@@ -413,6 +416,10 @@ async def test_approve_validation_refusal_audits_rejected_not_not_found(
     assert events[-1]["metadata"]["reason"] == "script_validation_failed"
 
 
+@pytest.mark.skipif(
+    not pinned_fs.supports_pinned_walk(),
+    reason="the verdict is declined without pinned opens, so the field is absent",
+)
 @pytest.mark.asyncio
 @pytest.mark.skipif(
     not pinned_fs.supports_pinned_tree_walk(),
@@ -428,6 +435,10 @@ async def test_pending_detail_carries_script_validation_verdict(loader, flagged_
     assert any("eval" in f for f in flagged_sv["report"]["evil.py"])
 
 
+@pytest.mark.skipif(
+    not pinned_fs.supports_pinned_walk(),
+    reason="the verdict is declined without pinned opens, so the field is absent",
+)
 @pytest.mark.asyncio
 @pytest.mark.skipif(
     not pinned_fs.supports_pinned_tree_walk(),
@@ -451,6 +462,7 @@ def test_none_wrapper_contract_preserved(flagged_loader):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not pinned_fs.supports_pinned_walk(), reason="no pinned layout verdict")
 async def test_pending_list_stray_top_level_entry_fails_verdict(loader):
     """A candidate with an unexpected top-level file must not read ``ok: true``:
     approve refuses it (_candidate_layout_ok), so the list verdict flags the
@@ -465,6 +477,7 @@ async def test_pending_list_stray_top_level_entry_fails_verdict(loader):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not pinned_fs.supports_pinned_walk(), reason="no pinned layout verdict")
 async def test_pending_list_symlinked_skill_md_fails_verdict(loader, tmp_path):
     """A symlinked SKILL.md passes the exists() listing gate (it follows the
     link) but approve refuses the candidate — the verdict must flag the layout
@@ -485,6 +498,7 @@ async def test_pending_list_symlinked_skill_md_fails_verdict(loader, tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not pinned_fs.supports_pinned_walk(), reason="no pinned layout verdict")
 async def test_pending_list_symlinked_candidate_root_fails_verdict(loader, tmp_path):
     """The approve path refuses a candidate whose ROOT is a symlink
     (_candidate_has_symlink checks pdir itself); the verdict must predict that
@@ -507,6 +521,75 @@ async def test_pending_list_symlinked_candidate_root_fails_verdict(loader, tmp_p
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("root_is_junction", [False, True], ids=["swappable-root", "junction"])
+async def test_pending_list_non_pinned_omits_verdict_without_scanning(
+    loader, monkeypatch, root_is_junction
+):
+    """No root scan, even when a pre-scan link check would report a real directory.
+
+    A negative link check cannot prevent a subsequent junction swap. Decline
+    the verdict without scanning, rather than reporting target entry names.
+    """
+    import os
+
+    pdir = loader._pending_root() / "deploy-helper"
+    (pdir / "sekret-junction-target.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(pinned_fs, "supports_pinned_walk", lambda: False)
+    real_is_link_or_junction = skills_mod.is_link_or_junction
+    monkeypatch.setattr(
+        skills_mod,
+        "is_link_or_junction",
+        lambda p: (
+            root_is_junction if os.fspath(p) == os.fspath(pdir) else real_is_link_or_junction(p)
+        ),
+    )
+    assert not os.path.islink(pdir), "the simulated junction must be invisible to islink"
+    real_scandir = os.scandir
+    scans = []
+
+    def track_scandir(path):
+        if not isinstance(path, int) and os.fspath(path) == os.fspath(pdir):
+            scans.append(path)
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", track_scandir)
+    verdict = loader._pending_scripts_verdict(pdir)
+    assert not scans, "non-pinned verdict scanned the candidate root by name"
+    assert verdict is None
+    resp = await H.api_skills_pending(_Req(loader))
+    (entry,) = _payload(resp)["pending"]
+    assert not scans, "pending-list handler scanned the candidate root by name"
+    assert "script_validation" not in entry
+    assert "sekret-junction-target" not in json.dumps(entry)
+
+
+@pytest.mark.parametrize("candidate_layout", ["no-scripts", "scripts", "invalid-layout"])
+def test_non_pinned_verdict_returns_before_any_candidate_inspection(
+    loader, monkeypatch, candidate_layout
+):
+    """Windows loses the badge entirely, not only for already-detected links."""
+    import os
+
+    pdir = loader._pending_root() / "deploy-helper"
+    if candidate_layout == "scripts":
+        (pdir / "scripts").mkdir()
+        (pdir / "scripts" / "clean.py").write_text("x = 1\n", encoding="utf-8")
+    elif candidate_layout == "invalid-layout":
+        (pdir / "extra.txt").write_text("planted\n", encoding="utf-8")
+    monkeypatch.setattr(pinned_fs, "supports_pinned_walk", lambda: False)
+
+    def unexpected_inspection(*args, **kwargs):
+        pytest.fail("non-pinned verdict attempted candidate inspection")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "scandir", unexpected_inspection)
+        scoped.setattr(os, "lstat", unexpected_inspection)
+        scoped.setattr(skills_mod, "is_link_or_junction", unexpected_inspection)
+        assert loader._pending_scripts_verdict(pdir) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not pinned_fs.supports_pinned_walk(), reason="no pinned layout verdict")
 async def test_pending_list_directory_valued_skill_md_fails_verdict(loader):
     """Approval reads SKILL.md's bytes, so a DIRECTORY named SKILL.md is
     refused at approve time — the verdict must not read ok:true for it."""
@@ -521,6 +604,7 @@ async def test_pending_list_directory_valued_skill_md_fails_verdict(loader):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not pinned_fs.supports_pinned_walk(), reason="no pinned layout verdict")
 async def test_pending_list_symlinked_candidate_flags_layout_without_reading(loader, tmp_path):
     """A candidate-planted ``scripts`` symlink must not be traversed by the
     list path (same guard as get_pending_skill): the verdict reports the
@@ -541,6 +625,10 @@ async def test_pending_list_symlinked_candidate_flags_layout_without_reading(loa
     assert any("invalid layout" in f for fs in sv["report"].values() for f in fs)
 
 
+@pytest.mark.skipif(
+    not pinned_fs.supports_pinned_walk(),
+    reason="the verdict is declined without pinned opens, so the field is absent",
+)
 @pytest.mark.asyncio
 @pytest.mark.skipif(
     not pinned_fs.supports_pinned_tree_walk(),
@@ -560,6 +648,10 @@ async def test_pending_list_survives_undecodable_script(flagged_loader):
     assert any("not valid UTF-8" in f for fs in sv["report"].values() for f in fs)
 
 
+@pytest.mark.skipif(
+    not pinned_fs.supports_pinned_walk(),
+    reason="the verdict is declined without pinned opens, so the field is absent",
+)
 @pytest.mark.asyncio
 @pytest.mark.skipif(
     not pinned_fs.supports_pinned_tree_walk(),
@@ -581,6 +673,10 @@ async def test_pending_list_oversized_script_flagged_from_stat_alone(loader):
     assert any("too large" in f for f in sv["report"]["big.py"])
 
 
+@pytest.mark.skipif(
+    not pinned_fs.supports_pinned_walk(),
+    reason="the verdict is declined without pinned opens, so the field is absent",
+)
 @pytest.mark.asyncio
 async def test_pending_list_verdict_refuses_symlink_without_trusting_precheck(
     loader, tmp_path, monkeypatch
@@ -604,6 +700,10 @@ async def test_pending_list_verdict_refuses_symlink_without_trusting_precheck(
     assert "sekret.py" not in json.dumps(sv["report"])
 
 
+@pytest.mark.skipif(
+    not pinned_fs.supports_pinned_walk(),
+    reason="the verdict is declined without pinned opens, so the field is absent",
+)
 @pytest.mark.asyncio
 @pytest.mark.skipif(
     not pinned_fs.supports_pinned_tree_walk(),
@@ -624,6 +724,10 @@ async def test_pending_list_verdict_bounds_file_count(loader):
     assert "script_validation" not in entry or entry["script_validation"] is None
 
 
+@pytest.mark.skipif(
+    not pinned_fs.supports_pinned_walk(),
+    reason="the verdict is declined without pinned opens, so the field is absent",
+)
 @pytest.mark.asyncio
 @pytest.mark.skipif(
     not pinned_fs.supports_pinned_tree_walk(),
@@ -656,14 +760,34 @@ async def test_pending_list_verdict_caps_tree_depth(loader):
 # one side without the other fails here, instead of silently desynchronizing
 # the badge from the server (a clean-badged candidate that approve refuses,
 # or a flagged one that approves).
+#
+# The mutation list below is hand-written, so on its own it can only cover
+# the refusal classes someone remembered to list. The vocabulary pin
+# (``test_approve_refusal_vocabulary_is_fully_classified``) closes that seam:
+# it reads the reason vocabulary out of the SOURCE (every literal the approve
+# path passes to ``PendingApprovalRefused``) and fails on any reason that is
+# neither exercised by a mutation here nor explicitly classified as not
+# predictable from a poll. A new refusal class therefore cannot ship an
+# under-predicting badge silently — it fails until someone classifies it.
 # ---------------------------------------------------------------------------
 
 
+def _predicts(reason):
+    """Tag a parity mutation with the approve refusal reason it provokes."""
+
+    def _tag(fn):
+        fn.predicts = reason
+        return fn
+
+    return _tag
+
+
+@_predicts("invalid_layout")
 def _mutate_stray_top_level(pdir, tmp_path):
     (pdir / "extra.txt").write_text("stray\n", encoding="utf-8")
-    return "invalid_layout"
 
 
+@_predicts("invalid_layout")
 def _mutate_symlinked_skill_md(pdir, tmp_path):
     import os
 
@@ -671,14 +795,14 @@ def _mutate_symlinked_skill_md(pdir, tmp_path):
     outside.write_text("# outside\n", encoding="utf-8")
     (pdir / "SKILL.md").unlink()
     os.symlink(str(outside), str(pdir / "SKILL.md"))
-    return "invalid_layout"
 
 
+@_predicts("invalid_layout")
 def _mutate_scripts_regular_file(pdir, tmp_path):
     (pdir / "scripts").write_text("not a dir\n", encoding="utf-8")
-    return "invalid_layout"
 
 
+@_predicts("invalid_layout")
 def _mutate_symlinked_scripts_dir(pdir, tmp_path):
     import os
 
@@ -686,27 +810,144 @@ def _mutate_symlinked_scripts_dir(pdir, tmp_path):
     outside.mkdir()
     (outside / "x.py").write_text("x = 1\n", encoding="utf-8")
     os.symlink(str(outside), str(pdir / "scripts"))
-    return "invalid_layout"
 
 
+@_predicts("script_validation_failed")
 def _mutate_failing_script(pdir, tmp_path):
     (pdir / "scripts").mkdir(exist_ok=True)
     (pdir / "scripts" / "evil.py").write_text(
         "import sys\nprint(eval(sys.argv[1]))\n", encoding="utf-8"
     )
-    return "script_validation_failed"
+
+
+_PARITY_MUTATIONS = [
+    _mutate_stray_top_level,
+    _mutate_symlinked_skill_md,
+    _mutate_scripts_regular_file,
+    _mutate_symlinked_scripts_dir,
+    _mutate_failing_script,
+]
+
+# Approve refusal reasons a poll-time verdict CANNOT predict, each with the
+# reason it cannot. Every key must be a reason the approve path actually
+# raises (the vocabulary pin fails on a stale or invented key), and a reason
+# may not be both exercised above and listed here. Adding a reason to the
+# approve path without a mutation above forces an entry here — with a
+# justification — before the suite goes green again.
+_UNPREDICTABLE_APPROVE_REFUSALS: dict[str, str] = {
+    "not_found": (
+        "no candidate to inspect: the slug is unsafe, has no SKILL.md, or is the "
+        "wrong kind for the approve variant called. A listed row always exists "
+        "at poll time, so this only arises from a poll→click race or a wrong "
+        "variant — not from anything in the candidate's own layout or scripts."
+    ),
+    "live_exists": (
+        "a live skill already holds the name. That is the state of the LIVE "
+        "namespace at click time, not a property of the candidate's layout or "
+        "scripts, which is all the verdict inspects."
+    ),
+    "target_missing": (
+        "update path only: the candidate's .meta.json names no live target, or "
+        "the live target auto-skill is gone. A live-namespace lookup, not a "
+        "candidate scripts finding."
+    ),
+    "stale_base": (
+        "update path only: the live target has moved past the version the "
+        "candidate was merged against. A live-vs-candidate version comparison "
+        "made at click time, not a candidate scripts finding."
+    ),
+    "redaction_failed": (
+        "the in-place redaction of SKILL.md / a script could not read or write "
+        "the file. The write half is click-time I/O a read-only poll cannot "
+        "observe; the unreadable-script half IS already surfaced by the verdict "
+        "as a finding, and SKILL.md content is outside the scripts verdict's "
+        "remit."
+    ),
+    "promotion_failed": (
+        "an OS-level read/write/move failure AFTER every check passed. "
+        "Click-time I/O that a read-only poll cannot observe."
+    ),
+}
+
+
+def _approve_refusal_reasons_from_source() -> set[str]:
+    """Every reason the approve path can raise, read from the SOURCE.
+
+    Walks the AST of every module in the ``kiro_crew`` package that mentions
+    ``PendingApprovalRefused(`` and collects the ``reason`` literal of each
+    construction. This is the ground truth the classification is checked
+    against — not a second hand-written list that could drift the same way
+    the mutation list can. A construction whose reason is not a string
+    literal is a hard failure: it cannot be classified, so the pin cannot
+    vouch for it.
+    """
+    pkg_root = Path(skills_mod.__file__).resolve().parent
+    reasons: set[str] = set()
+    for py in sorted(pkg_root.rglob("*.py")):
+        text = py.read_text(encoding="utf-8")
+        if "PendingApprovalRefused(" not in text:
+            continue
+        for node in ast.walk(ast.parse(text, filename=str(py))):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            callee = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
+            if callee != "PendingApprovalRefused":
+                continue
+            arg = None
+            if node.args:
+                arg = node.args[0]
+            else:
+                for kw in node.keywords:
+                    if kw.arg == "reason":
+                        arg = kw.value
+            if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)):
+                pytest.fail(
+                    f"{py.relative_to(pkg_root)}:{node.lineno}: PendingApprovalRefused "
+                    "constructed with a non-literal reason — the parity pin cannot "
+                    "classify it; pass a string literal"
+                )
+            reasons.add(arg.value)
+    return reasons
+
+
+def test_approve_refusal_vocabulary_is_fully_classified():
+    """Drift pin: a new approve refusal reason fails until it is classified.
+
+    The source vocabulary must equal ``exercised ∪ unpredictable`` exactly —
+    an unlisted new reason fails (it would ship an under-predicting badge
+    silently), a classified reason the approve path does not raise fails
+    (stale classification), and a reason may not sit on both sides.
+    """
+    source_reasons = _approve_refusal_reasons_from_source()
+    exercised = {m.predicts for m in _PARITY_MUTATIONS}
+    unpredictable = set(_UNPREDICTABLE_APPROVE_REFUSALS)
+    # Coherence check on the scan itself: it must at least have found the
+    # classes the parametrized parity test demonstrably provokes.
+    assert exercised <= source_reasons, sorted(exercised - source_reasons)
+    both = exercised & unpredictable
+    assert not both, f"classified as unpredictable but exercised by a mutation: {sorted(both)}"
+    unclassified = source_reasons - exercised - unpredictable
+    assert not unclassified, (
+        f"approve path can raise {sorted(unclassified)} but no parity mutation exercises "
+        "them and they are not classified as unpredictable — add a _PARITY_MUTATIONS "
+        "case, or an entry in _UNPREDICTABLE_APPROVE_REFUSALS stating WHY a poll cannot "
+        "predict it"
+    )
+    stale = unpredictable - source_reasons
+    assert not stale, f"classified reasons the approve path does not raise: {sorted(stale)}"
+    for reason, why in _UNPREDICTABLE_APPROVE_REFUSALS.items():
+        assert why.strip(), f"{reason}: unpredictable classification must state why"
+    # The exception's docstring is the user-facing vocabulary; keep it honest.
+    doc = PendingApprovalRefused.__doc__ or ""
+    for reason in sorted(source_reasons):
+        assert f"``{reason}``" in doc, f"PendingApprovalRefused docstring omits {reason!r}"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mutate",
-    [
-        _mutate_stray_top_level,
-        _mutate_symlinked_skill_md,
-        _mutate_scripts_regular_file,
-        _mutate_symlinked_scripts_dir,
-        _mutate_failing_script,
-    ],
+    _PARITY_MUTATIONS,
     ids=[
         "stray-top-level",
         "symlinked-skill-md",
@@ -715,11 +956,15 @@ def _mutate_failing_script(pdir, tmp_path):
         "failing-script",
     ],
 )
-async def test_verdict_predicts_every_approve_refusal_class(loader, tmp_path, mutate):
-    from kiro_crew.skills import PendingApprovalRefused
-
+@pytest.mark.parametrize("without_pinned_walk", [False, True], ids=["native", "non-pinned"])
+async def test_verdict_predicts_every_approve_refusal_class(
+    loader, tmp_path, monkeypatch, mutate, without_pinned_walk
+):
+    if without_pinned_walk:
+        monkeypatch.setattr(pinned_fs, "supports_pinned_walk", lambda: False)
     pdir = loader._pending_root() / "deploy-helper"
-    expected_reason = mutate(pdir, tmp_path)
+    mutate(pdir, tmp_path)
+    expected_reason = mutate.predicts
     # First PROVE the approve path refuses this candidate (not assumed): the
     # parity claim is only meaningful against a demonstrated refusal.
     with pytest.raises(PendingApprovalRefused) as exc:
@@ -729,19 +974,20 @@ async def test_verdict_predicts_every_approve_refusal_class(loader, tmp_path, mu
     # verdict reads ok: false.
     resp = await H.api_skills_pending(_Req(loader))
     (entry,) = _payload(resp)["pending"]
+    if not pinned_fs.supports_pinned_walk():
+        # Windows has no trustworthy layout OR content verdict. The pre-click
+        # badge disappears entirely; approve's refusal above is unchanged.
+        assert "script_validation" not in entry
+        return
     if "script_validation" not in entry:
-        # The documented platform contract, not a hole in parity: without a
-        # descriptor-pinned walk (Windows) the CONTENT stage cannot read the
-        # scripts safely, so the verdict is omitted rather than asserted —
-        # never a false all-clear. Layout refusals are stat-only and must
-        # still be predicted even here, so only a content-stage refusal may
-        # take this branch.
+        # With pinned opens but no tree walk, only content-stage refusals may
+        # be omitted. Pinned layout refusals must still be predicted.
         assert (
             not pinned_fs.supports_pinned_tree_walk()
         ), "verdict missing on a platform that supports the pinned walk"
         assert (
             expected_reason == "script_validation_failed"
-        ), f"layout refusal {expected_reason!r} must carry a verdict on every platform"
+        ), f"layout refusal {expected_reason!r} must carry a verdict with pinned opens"
         return
     sv = entry["script_validation"]
     assert (
@@ -749,6 +995,10 @@ async def test_verdict_predicts_every_approve_refusal_class(loader, tmp_path, mu
     ), f"verdict read clean for a candidate approve refuses ({expected_reason})"
 
 
+@pytest.mark.skipif(
+    not pinned_fs.supports_pinned_walk(),
+    reason="the verdict is declined without pinned opens, so the field is absent",
+)
 @pytest.mark.asyncio
 @pytest.mark.skipif(
     not pinned_fs.supports_pinned_tree_walk(),
@@ -788,6 +1038,10 @@ async def test_verdict_refuses_entry_swapped_after_stat(loader, monkeypatch):
     assert any("changed during scan" in f for fs in sv["report"].values() for f in fs)
 
 
+@pytest.mark.skipif(
+    not pinned_fs.supports_pinned_walk(),
+    reason="the verdict is declined without pinned opens, so the field is absent",
+)
 @pytest.mark.asyncio
 @pytest.mark.skipif(
     not pinned_fs.supports_pinned_tree_walk(),
@@ -814,3 +1068,132 @@ async def test_verdict_flags_redaction_breaking_script(loader, monkeypatch):
     (entry,) = _payload(resp)["pending"]
     sv = entry["script_validation"]
     assert sv["ok"] is False
+
+
+def _truncation_message(entries=0, findings=0, chars=0):
+    return [
+        "too large: validation report truncated; "
+        f"omitted {entries} script entries, "
+        f"{findings} findings from retained entries, "
+        f"{chars} characters from retained strings"
+    ]
+
+
+def test_validation_report_entry_bound(loader):
+    cap = skills_mod._PENDING_SCRIPT_MAX_ENTRIES
+    # The healthy boundary retains ALL entries without a truncation warning.
+    healthy = {f"s{i}.py": ["invalid layout: example"] for i in range(cap)}
+    assert loader._redact_validation_report(healthy) == healthy
+    crowded = {**healthy, **{f"overflow{i}.py": ["omitted"] for i in range(7)}}
+    bounded = loader._redact_validation_report(crowded)
+    assert len(bounded) == cap + 1  # script population + one fixed summary
+    assert {k: v for k, v in bounded.items() if k != "<truncated>"} == healthy
+    assert bounded["<truncated>"] == _truncation_message(entries=7)
+
+
+@pytest.mark.parametrize("field", ["filename", "finding"])
+def test_validation_report_string_bound(loader, field):
+    cap = skills_mod._VALIDATION_REPORT_MAX_STRING_CHARS
+    for excess in (0, 13):
+        text = "z" * (cap + excess)
+        report = {text: ["invalid layout: example"]} if field == "filename" else {"a.py": [text]}
+        bounded = loader._redact_validation_report(report)
+        expected = (
+            {"z" * cap: ["invalid layout: example"]}
+            if field == "filename"
+            else {"a.py": ["z" * cap]}
+        )
+        if excess:
+            expected["<truncated>"] = _truncation_message(chars=excess)
+        assert bounded == expected
+        assert all(len(k) <= cap for k in bounded)
+        assert all(len(v) <= cap for findings in bounded.values() for v in findings)
+
+
+def test_validation_report_finding_bound(loader):
+    cap = skills_mod._VALIDATION_REPORT_MAX_FINDINGS
+    healthy = {"a.py": [f"invalid layout: issue {i}" for i in range(cap)]}
+    assert loader._redact_validation_report(healthy) == healthy
+    bounded = loader._redact_validation_report({"a.py": healthy["a.py"] + ["extra"] * 9})
+    assert bounded["a.py"] == healthy["a.py"]
+    assert len(bounded["a.py"]) == cap
+    assert bounded["<truncated>"] == _truncation_message(findings=9)
+
+
+def test_validation_report_counts_all_truncation_once(loader):
+    entries = skills_mod._PENDING_SCRIPT_MAX_ENTRIES
+    findings = skills_mod._VALIDATION_REPORT_MAX_FINDINGS
+    chars = skills_mod._VALIDATION_REPORT_MAX_STRING_CHARS
+    # Two shortened names collide, and a third name tries to steal the fixed
+    # summary slot. Neither may overwrite retained findings or hide an omission.
+    report = {
+        "z" * (chars + 2): ["x" * (chars + 3)] * (findings + 5),
+        "z" * (chars + 4): ["must not overwrite"],
+        "<truncated>": ["must not replace the summary"],
+        **{f"s{i}.py": ["invalid layout: example"] for i in range(entries)},
+    }
+    bounded = loader._redact_validation_report(report)
+    assert bounded["z" * chars] == ["x" * chars] * findings
+    assert bounded["<truncated>"] == _truncation_message(
+        entries=5, findings=5, chars=2 + 3 * findings
+    )
+    assert sum("validation report truncated;" in f for fs in bounded.values() for f in fs) == 1
+    assert len(bounded) == entries - 1  # two collisions + one summary
+
+
+def test_validation_report_redacts_before_shortening(loader):
+    cap = skills_mod._VALIDATION_REPORT_MAX_STRING_CHARS
+    # Put a credential across the cut: shortening first leaks its prefix.
+    text = "z" * (cap - 5) + " AKIAIOSFODNN7EXAMPLE"
+    bounded = loader._redact_validation_report({text: [text]})
+    assert "AKIA" not in json.dumps(bounded)
+    key = next(iter(bounded))
+    assert key == loader._redact_text(text)[:cap]
+    assert bounded[key] == [key]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["approve", "detail", "list"])
+async def test_validation_report_bounded_on_every_http_surface(
+    flagged_loader, monkeypatch, surface
+):
+    cap = skills_mod._PENDING_SCRIPT_MAX_ENTRIES
+    report = {f"s{i}.py": ["invalid layout: example"] for i in range(cap + 7)}
+    monkeypatch.setattr(skills_mod, "validate_scripts", lambda _scripts: (False, report))
+    monkeypatch.setattr(flagged_loader, "_pending_scripts_verdict", lambda _pdir: (False, report))
+    request = _Req(flagged_loader, match={"slug": "evil-helper"})
+    if surface == "approve":
+        response = await H.api_skill_pending_approve(request)
+        assert response.status == 422
+        actual = _payload(response)["report"]
+    elif surface == "detail":
+        response = await H.api_skill_pending_detail(request)
+        assert response.status == 200
+        actual = _payload(response)["script_validation"]["report"]
+    else:
+        response = await H.api_skills_pending(request)
+        assert response.status == 200
+        actual = _payload(response)["pending"][0]["script_validation"]["report"]
+    assert len(actual) == cap + 1
+    assert actual["<truncated>"] == _truncation_message(entries=7)
+
+
+@pytest.mark.skipif(
+    not pinned_fs.supports_pinned_tree_walk(),
+    reason="verdict omitted without a descriptor-pinned walk",
+)
+def test_validation_report_and_verdict_share_entry_budget(loader, monkeypatch):
+    # Change the ONE population budget, not either consumer. Both must follow
+    # it, with no independent literal drifting back into the verdict walk.
+    monkeypatch.setattr(skills_mod, "_PENDING_SCRIPT_MAX_ENTRIES", 3)
+    pdir = loader._pending_root() / "deploy-helper"
+    sdir = pdir / "scripts"
+    sdir.mkdir()
+    for i in range(3):
+        (sdir / f"s{i}.py").write_text("x = 1\n", encoding="utf-8")
+    assert loader._pending_scripts_verdict(pdir) == (True, {})
+    (sdir / "extra.py").write_text("x = 1\n", encoding="utf-8")
+    assert loader._pending_scripts_verdict(pdir) is None
+    bounded = loader._redact_validation_report({f"s{i}.py": ["finding"] for i in range(4)})
+    assert len(bounded) == 4
+    assert bounded["<truncated>"] == _truncation_message(entries=1)

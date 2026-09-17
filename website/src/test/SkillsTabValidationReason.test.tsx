@@ -89,6 +89,25 @@ const FLAGGED_DETAIL = {
   script_validation: { ok: false, report: REPORT },
 }
 
+/** The flagged candidate as it appears in the LIVE list once approved elsewhere. */
+const LIVE_SKILL = {
+  key: 'auto/evil-helper',
+  name: 'auto/evil-helper',
+  description: 'does bad things',
+  source: 'local',
+}
+
+/* The three sentences a not-found approve refusal can settle on. The hedge is
+ * honest only while the live-list refetch is pending or failed; once it settles,
+ * the notice must state the outcome ONCE instead of hedging and then answering
+ * itself a line below. */
+const HEDGED =
+  'Candidate “auto/evil-helper” is no longer pending — it was approved or dismissed in another window or by the agent, so there was nothing left to approve.'
+const SETTLED_DISMISSED =
+  'Candidate “auto/evil-helper” is no longer pending — it was dismissed in another window or by the agent and does not appear under Skills, so there was nothing left to approve.'
+const SETTLED_APPROVED =
+  'Candidate “auto/evil-helper” is no longer pending — it was already approved in another window or by the agent and now appears under Skills below, so there was nothing left to approve.'
+
 beforeEach(() => {
   vi.clearAllMocks()
   mockApi.skills.mockResolvedValue([])
@@ -147,9 +166,51 @@ describe('pending-card script-validation verdict (issue #10861)', () => {
         screen.getByText('Approval refused: the bundled scripts failed validation — approving again without changes returns this same refusal. Fix the scripts, then approve.'),
       ).toBeInTheDocument(),
     )
-    // The per-file findings render next to the card (post-click evidence),
-    // in addition to the pre-approval copy inside the expanded panel.
-    expect(screen.getAllByText("dynamic exec/import: eval()").length).toBeGreaterThanOrEqual(1)
+    // The findings are the 422's OWN, and they render INSIDE the error notice.
+    // `errors-use-error-notice` decides by where a value comes from, so the
+    // same list in a hand-rolled box beside the notice would be a second error
+    // surface — one that throws away the endpoint/status context the notice
+    // recovers for the agent hand-off.
+    const findings = screen.getAllByText('dynamic exec/import: eval()')
+    expect(findings).toHaveLength(1)
+    expect(screen.getByRole('alert')).toContainElement(findings[0])
+    // Exactly one copy, because the pre-approval PREDICTION is withdrawn once
+    // the outcome it predicted is on screen: a poll-time snapshot must not sit
+    // beside findings the server just computed on the live tree, where the
+    // stale list is indistinguishable from the fresh one.
+    expect(screen.queryByText('Validation findings')).not.toBeInTheDocument()
+  })
+
+  it('keeps the pre-approval prediction when the refusal is NOT about validation', async () => {
+    // The prediction is withdrawn only by the outcome it PREDICTED. A refusal
+    // with any other code (here: a live skill already holds the name) has not
+    // superseded it, so the flagged candidate's findings must still be on
+    // offer — the user still has to fix them. Pins the gate to the refusal
+    // CODE: narrowing it to a bare `!approveRefusal` would silently drop the
+    // prediction for every unrelated failure.
+    mockApi.skillsPending.mockResolvedValue({ pending: [FLAGGED_ROW] })
+    const body = JSON.stringify({
+      error: 'a live skill with this name already exists',
+      code: 'live_skill_exists',
+    })
+    mockApi.approvePendingSkill.mockRejectedValue(
+      Object.assign(new Error('conflict'), { status: 409, body }),
+    )
+    renderWithQuery()
+    await waitFor(() => expect(screen.getByText('auto/evil-helper')).toBeInTheDocument())
+    fireEvent.click(screen.getByText('Review'))
+    const approve = screen.getByText('Approve').closest('button') as HTMLButtonElement
+    await waitFor(() => expect(approve).not.toBeDisabled())
+    fireEvent.click(approve)
+    await waitFor(() =>
+      expect(screen.getByRole('alert')).toBeInTheDocument(),
+    )
+    // Prediction survives, and its findings are NOT inside the error notice —
+    // they describe something that has not failed, which the rule excludes.
+    expect(screen.getByText('Validation findings')).toBeInTheDocument()
+    const findings = screen.getAllByText('dynamic exec/import: eval()')
+    expect(findings).toHaveLength(1)
+    expect(screen.getByRole('alert')).not.toContainElement(findings[0])
   })
 
   it('maps a live-exists refusal to its own message', async () => {
@@ -235,12 +296,15 @@ describe('pending-card script-validation verdict (issue #10861)', () => {
       // localized failure through ErrorNotice (errors-use-error-notice —
       // the value originates in a rejected mutation, so the shared error
       // surface with its Ask-agent hand-off is mandatory), NAMING the
-      // candidate and mapping the coded reason to catalog text.
+      // candidate and mapping the coded reason to catalog text. The live
+      // list (mocked empty) settles, so the reason states the DISMISSAL
+      // outright rather than "approved or dismissed".
       await waitFor(() =>
         expect(
-          screen.getByText('Dismiss of “auto/evil-helper” failed (this candidate is no longer pending — approved or dismissed in another window or by the agent).'),
+          screen.getByText('Dismiss of “auto/evil-helper” failed (this candidate is no longer pending — it was already dismissed in another window or by the agent and does not appear under Skills).'),
         ).toBeInTheDocument(),
       )
+      expect(screen.getByRole('alert').textContent).not.toContain('approved or dismissed')
       expect(screen.getByText('Ask the agent about this failure')).toBeInTheDocument()
       // And the queue is re-read so the stale row cannot contradict the
       // notice (same recovery as the approve path's not-found branch).
@@ -251,9 +315,74 @@ describe('pending-card script-validation verdict (issue #10861)', () => {
       fireEvent.click(screen.getByText('Dismiss'))
       await waitFor(() =>
         expect(
-          screen.queryByText('Dismiss of “auto/evil-helper” failed (this candidate is no longer pending — approved or dismissed in another window or by the agent).'),
+          screen.queryByText('Dismiss of “auto/evil-helper” failed (this candidate is no longer pending — it was already dismissed in another window or by the agent and does not appear under Skills).'),
         ).not.toBeInTheDocument(),
       )
+    } finally {
+      confirmSpy.mockRestore()
+    }
+  })
+
+  it('a not-found dismiss keeps the open wording while the live list cannot answer', async () => {
+    mockApi.skillsPending.mockResolvedValue({ pending: [FLAGGED_ROW] })
+    // Initial load succeeds; the refetch the not-found branch triggers FAILS,
+    // so the app does not know which way the candidate went — the reason must
+    // say so, and must not claim a dismissal off an empty-by-error list.
+    mockApi.skills.mockResolvedValueOnce([]).mockRejectedValue(new Error('boom'))
+    mockApi.dismissPendingSkill.mockRejectedValue(
+      Object.assign(new Error('pending skill not found'), {
+        status: 404,
+        body: JSON.stringify({ error: 'pending skill not found', code: 'pending_skill_not_found' }),
+      }),
+    )
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    try {
+      renderWithQuery()
+      await waitFor(() => expect(screen.getByText('auto/evil-helper')).toBeInTheDocument())
+      fireEvent.click(screen.getByText('Dismiss'))
+      await waitFor(() =>
+        expect(
+          screen.getByText('Dismiss of “auto/evil-helper” failed (this candidate is no longer pending — approved or dismissed in another window or by the agent).'),
+        ).toBeInTheDocument(),
+      )
+      await waitFor(() => expect(mockApi.skills.mock.calls.length).toBeGreaterThan(1))
+      // The refetch has failed; the hedge stands and no outcome is asserted.
+      expect(
+        screen.getByText('Dismiss of “auto/evil-helper” failed (this candidate is no longer pending — approved or dismissed in another window or by the agent).'),
+      ).toBeInTheDocument()
+      expect(screen.getByRole('alert').textContent).not.toContain('already dismissed')
+      expect(screen.getByRole('alert').textContent).not.toContain('already approved')
+    } finally {
+      confirmSpy.mockRestore()
+    }
+  })
+
+  it('a not-found dismiss resolves to "already approved" when the skill went live', async () => {
+    mockApi.skillsPending.mockResolvedValue({ pending: [FLAGGED_ROW] })
+    // The live list's refetch now holds the candidate under its name: it was
+    // approved elsewhere, and the notice says exactly that. Flipped right
+    // before the click, not by call count — the tab reads the same list at
+    // mount and a count-based mock would seat the skill before the refusal.
+    let live = false
+    mockApi.skills.mockImplementation(() => Promise.resolve(live ? [LIVE_SKILL] : []))
+    mockApi.dismissPendingSkill.mockRejectedValue(
+      Object.assign(new Error('pending skill not found'), {
+        status: 404,
+        body: JSON.stringify({ error: 'pending skill not found', code: 'pending_skill_not_found' }),
+      }),
+    )
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    try {
+      renderWithQuery()
+      await waitFor(() => expect(screen.getByText('auto/evil-helper')).toBeInTheDocument())
+      live = true
+      fireEvent.click(screen.getByText('Dismiss'))
+      await waitFor(() =>
+        expect(
+          screen.getByText('Dismiss of “auto/evil-helper” failed (this candidate is no longer pending — it was already approved in another window or by the agent and now appears under Skills below).'),
+        ).toBeInTheDocument(),
+      )
+      expect(screen.getByRole('alert').textContent).not.toContain('approved or dismissed')
     } finally {
       confirmSpy.mockRestore()
     }
@@ -266,7 +395,7 @@ describe('pending-card script-validation verdict (issue #10861)', () => {
       .mockResolvedValueOnce({ pending: [FLAGGED_ROW] })
       .mockResolvedValue({ pending: [] })
     // The live list the refusal branch refetches: the candidate is NOT in it,
-    // so the resolution line states it was dismissed.
+    // so the notice resolves to a dismissal.
     mockApi.skills.mockResolvedValue([])
     mockApi.approvePendingSkill.mockRejectedValue(
       Object.assign(new Error('pending skill not found'), {
@@ -283,20 +412,87 @@ describe('pending-card script-validation verdict (issue #10861)', () => {
     // The row disappears (queue re-read as empty) …
     await waitFor(() => expect(screen.queryByText('auto/evil-helper')).not.toBeInTheDocument())
     // … but the refusal does NOT: it moved to the panel, so the user never
-    // mistakes the removal for a successful approve.
-    expect(
-      screen.getByText('Approval of “auto/evil-helper” failed: this candidate is no longer pending — it was approved or dismissed in another window or by the agent.'),
-    ).toBeInTheDocument()
-    // "Approved or dismissed" is RESOLVED from the refetched live list: the
-    // candidate never appeared there, so the line names the dismissal.
+    // mistakes the removal for a successful approve. "Approved or dismissed"
+    // is RESOLVED from the refetched live list — the candidate never appeared
+    // there — and the notice states the dismissal ONCE, in the message.
     await waitFor(() =>
       expect(
-        screen.getByText('It was dismissed — it does not appear under Skills.'),
+        screen.getByText(SETTLED_DISMISSED),
       ).toBeInTheDocument(),
     )
+    const alert = screen.getByRole('alert')
+    // The click still did nothing; that is kept in the settled sentence.
+    expect(alert.textContent).toContain('nothing left to approve')
+    // One statement per screen: no hedge above the answer, and no separate
+    // resolution line repeating it below (the shot-05 "hedges then answers
+    // itself" reading).
+    expect(alert.textContent).not.toContain('approved or dismissed')
+    expect(alert.textContent).not.toContain('It was dismissed')
+    expect(screen.queryByText(HEDGED)).not.toBeInTheDocument()
   })
 
-  it('a failed live-list fetch withholds the resolution line instead of claiming a dismissal', async () => {
+  it('a not-found approve refusal resolves to "already approved" when the skill went live', async () => {
+    mockApi.skillsPending
+      .mockResolvedValueOnce({ pending: [FLAGGED_ROW] })
+      .mockResolvedValue({ pending: [] })
+    // The refetch the refusal triggers finds the candidate live under its
+    // name — it was approved elsewhere. Flipped right before the click (see
+    // the dismiss-path twin for why not a call count).
+    let live = false
+    mockApi.skills.mockImplementation(() => Promise.resolve(live ? [LIVE_SKILL] : []))
+    mockApi.approvePendingSkill.mockRejectedValue(
+      Object.assign(new Error('pending skill not found'), {
+        status: 404,
+        body: JSON.stringify({ error: 'pending skill not found', code: 'pending_skill_not_found' }),
+      }),
+    )
+    renderWithQuery()
+    await waitFor(() => expect(screen.getByText('auto/evil-helper')).toBeInTheDocument())
+    fireEvent.click(screen.getByText('Review'))
+    const approve = screen.getByText('Approve').closest('button') as HTMLButtonElement
+    await waitFor(() => expect(approve).not.toBeDisabled())
+    live = true
+    fireEvent.click(approve)
+    await waitFor(() =>
+      expect(
+        screen.getByText(SETTLED_APPROVED),
+      ).toBeInTheDocument(),
+    )
+    const alert = screen.getByRole('alert')
+    expect(alert.textContent).not.toContain('approved or dismissed')
+    expect(alert.textContent).not.toContain('It was approved')
+    expect(screen.queryByText(HEDGED)).not.toBeInTheDocument()
+  })
+
+  it('keeps the open wording while the live-list refetch is still in flight', async () => {
+    mockApi.skillsPending
+      .mockResolvedValueOnce({ pending: [FLAGGED_ROW] })
+      .mockResolvedValue({ pending: [] })
+    // The refetch never settles: the app does not yet know which way the
+    // candidate went, so the hedge is the honest sentence — and no outcome
+    // may be asserted off the stale (empty) cache in the meantime.
+    mockApi.skills.mockResolvedValueOnce([]).mockReturnValue(new Promise<never>(() => {}))
+    mockApi.approvePendingSkill.mockRejectedValue(
+      Object.assign(new Error('pending skill not found'), {
+        status: 404,
+        body: JSON.stringify({ error: 'pending skill not found', code: 'pending_skill_not_found' }),
+      }),
+    )
+    renderWithQuery()
+    await waitFor(() => expect(screen.getByText('auto/evil-helper')).toBeInTheDocument())
+    fireEvent.click(screen.getByText('Review'))
+    const approve = screen.getByText('Approve').closest('button') as HTMLButtonElement
+    await waitFor(() => expect(approve).not.toBeDisabled())
+    fireEvent.click(approve)
+    await waitFor(() => expect(screen.getByText(HEDGED)).toBeInTheDocument())
+    await waitFor(() => expect(mockApi.skills.mock.calls.length).toBeGreaterThan(1))
+    // Still pending: the hedge stands, unresolved.
+    expect(screen.getByText(HEDGED)).toBeInTheDocument()
+    expect(screen.queryByText(SETTLED_DISMISSED)).not.toBeInTheDocument()
+    expect(screen.queryByText(SETTLED_APPROVED)).not.toBeInTheDocument()
+  })
+
+  it('a failed live-list fetch keeps the open wording instead of claiming a dismissal', async () => {
     mockApi.skillsPending
       .mockResolvedValueOnce({ pending: [FLAGGED_ROW] })
       .mockResolvedValue({ pending: [] })
@@ -316,17 +512,13 @@ describe('pending-card script-validation verdict (issue #10861)', () => {
     const approve = screen.getByText('Approve').closest('button') as HTMLButtonElement
     await waitFor(() => expect(approve).not.toBeDisabled())
     fireEvent.click(approve)
-    await waitFor(() =>
-      expect(
-        screen.getByText('Approval of “auto/evil-helper” failed: this candidate is no longer pending — it was approved or dismissed in another window or by the agent.'),
-      ).toBeInTheDocument(),
-    )
-    expect(
-      screen.queryByText('It was dismissed — it does not appear under Skills.'),
-    ).not.toBeInTheDocument()
-    expect(
-      screen.queryByText('It was approved — it now appears under Skills below.'),
-    ).not.toBeInTheDocument()
+    await waitFor(() => expect(screen.getByText(HEDGED)).toBeInTheDocument())
+    // Wait for the failed refetch to have happened, then re-check: the hedge
+    // must SURVIVE the failure, not just precede the answer.
+    await waitFor(() => expect(mockApi.skills.mock.calls.length).toBeGreaterThan(1))
+    expect(screen.getByText(HEDGED)).toBeInTheDocument()
+    expect(screen.queryByText(SETTLED_DISMISSED)).not.toBeInTheDocument()
+    expect(screen.queryByText(SETTLED_APPROVED)).not.toBeInTheDocument()
   })
 
   it('the panel notice is evicted when its subject slug is restaged', async () => {
@@ -349,18 +541,12 @@ describe('pending-card script-validation verdict (issue #10861)', () => {
     const approve = screen.getByText('Approve').closest('button') as HTMLButtonElement
     await waitFor(() => expect(approve).not.toBeDisabled())
     fireEvent.click(approve)
-    await waitFor(() =>
-      expect(
-        screen.getByText('Approval of “auto/evil-helper” failed: this candidate is no longer pending — it was approved or dismissed in another window or by the agent.'),
-      ).toBeInTheDocument(),
-    )
+    // The live list (mocked empty) settles, so the notice reads as dismissed.
+    await waitFor(() => expect(screen.getByText(SETTLED_DISMISSED)).toBeInTheDocument())
     // The restage poll returns the slug with a fresh created_at.
     await act(() => qcRef!.invalidateQueries({ queryKey: ['skills-pending'] }))
     await waitFor(() => expect(screen.getByText('auto/evil-helper')).toBeInTheDocument())
-    await waitFor(() =>
-      expect(
-        screen.queryByText('Approval of “auto/evil-helper” failed: this candidate is no longer pending — it was approved or dismissed in another window or by the agent.'),
-      ).not.toBeInTheDocument(),
-    )
+    await waitFor(() => expect(screen.queryByText(SETTLED_DISMISSED)).not.toBeInTheDocument())
+    expect(screen.queryByText(HEDGED)).not.toBeInTheDocument()
   })
 })

@@ -163,21 +163,24 @@ try {
   await page.getByRole('button', { name: 'Review', exact: true }).first().click()
   const approve2 = page.getByRole('button', { name: 'Approve', exact: true }).nth(1)
   await approve2.click()
-  // The notice's container now also holds the resolution footer, so a
-  // full-container exact-text match no longer fits. Anchor on the single
-  // role=alert banner carrying the refusal lead; the resolution line below
-  // keeps the exact-text check for the frame's key content.
+  // The refusal lead is shared by the hedging and the resolved sentences, so a
+  // full-container exact-text match cannot pick the frame's state. Anchor on
+  // the single role=alert banner carrying the lead first …
   await page
     .getByRole('alert')
-    .filter({ hasText: 'Approval of “auto/rotate-staging-fixtures” failed' })
+    .filter({ hasText: 'Candidate “auto/rotate-staging-fixtures” is no longer pending' })
     .first()
     .waitFor()
   // The named NOTICE also contains the candidate's name, so wait on the row's
   // own controls: an emptied queue has no Review buttons left.
   await page.getByRole('button', { name: 'Review', exact: true }).first().waitFor({ state: 'detached' })
-  // The resolution line: the stub live list never holds the candidate, so the
-  // outcome resolves to a dismissal.
-  await page.getByText('It was dismissed — it does not appear under Skills.', { exact: true }).first().waitFor()
+  // … then on the SETTLED sentence: the stub live list never holds the
+  // candidate, so the message itself states the dismissal (no separate
+  // resolution line under a hedge — the frame must show one statement).
+  await page
+    .getByText('Candidate “auto/rotate-staging-fixtures” is no longer pending — it was dismissed in another window or by the agent and does not appear under Skills, so there was nothing left to approve.', { exact: true })
+    .first()
+    .waitFor()
   await shot(page, '05-notfound-empty-queue')
   await page.close()
   console.log(`wrote frames to ${OUT} (prefix ${PREFIX})`)

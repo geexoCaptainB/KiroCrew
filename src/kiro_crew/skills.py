@@ -18,7 +18,7 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from itertools import zip_longest
+from itertools import islice, zip_longest
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable, Iterator
 
@@ -59,6 +59,12 @@ logger = logging.getLogger(__name__)
 
 
 SKILLS_DIR_NAME = "skills"
+# One script-entry population budget for the pending verdict and API reports.
+# Reports may additionally retain ONE fixed truncation-summary entry.
+_PENDING_SCRIPT_MAX_ENTRIES = 64
+_VALIDATION_REPORT_MAX_FINDINGS = 16
+_VALIDATION_REPORT_MAX_STRING_CHARS = 1024
+_VALIDATION_REPORT_TRUNCATION_KEY = "<truncated>"
 #: Re-exported from ``trigger_match``, which owns the value and the grammar
 #: it belongs to. Kept as a module name because tests and call sites here
 #: reference it.
@@ -4113,7 +4119,7 @@ class SkillsLoader:
 
     _ALLOWED_CANDIDATE_TOP = frozenset({"SKILL.md", ".meta.json", "scripts"})
 
-    def _candidate_layout_findings(self, pdir: Path) -> list[str]:
+    def _candidate_layout_findings(self, pdir: Path) -> list[str] | None:
         """Top-level layout check mirroring ``_candidate_layout_ok``.
 
         The approve path refuses a candidate whose ROOT layout is wrong — a
@@ -4131,10 +4137,10 @@ class SkillsLoader:
         candidate root swapped for a symlink between any check and the scan
         cannot redirect it; the pinned open refuses the link instead of
         following it into a tree whose entry names would then leak into the
-        dashboard's findings. The by-name ``lstat`` scan remains only as the
-        non-pinned-platform fallback, where its REFUSALS are still
-        trustworthy and a clean result never reaches ``ok: true`` (the
-        verdict returns ``None`` before that on such platforms).
+        dashboard's findings. Without pinned opens, return ``None`` before
+        any by-name scan: even a refusal could leak a swapped junction's
+        target names. On Windows the pre-click "fails validation" badge
+        disappears entirely; approve remains the authority at click time.
 
         This is deliberately NOT the recursive candidate-wide pre-walk the
         budgets removed: one capped scan of the top level plus a stat per
@@ -4181,35 +4187,7 @@ class SkillsLoader:
                 return findings
             finally:
                 os.close(root_fd)
-        # Non-pinned platform fallback: by-name lstat only. Refusals here are
-        # trustworthy; a clean result is NOT promoted to ``ok: true`` (the
-        # verdict returns None for these platforms before reporting one).
-        if os.path.islink(pdir):
-            return ["invalid layout: candidate root is a symlink"]
-        names = []
-        try:
-            with os.scandir(pdir) as scanner:
-                for entry in scanner:
-                    names.append(entry.name)
-                    if len(names) > 16:
-                        return ["invalid layout: too many top-level entries"]
-        except OSError:
-            return ["verdict unavailable: candidate unreadable"]
-        findings = []
-        for nm in sorted(names):
-            if nm not in self._ALLOWED_CANDIDATE_TOP:
-                findings.append(f"invalid layout: unexpected candidate entry {nm!r}")
-                continue
-            try:
-                est = os.lstat(pdir / nm)
-            except OSError:
-                findings.append(f"invalid layout: {nm!r} unreadable")
-                continue
-            if stat.S_ISLNK(est.st_mode):
-                findings.append(f"invalid layout: {nm!r} is a symlink")
-            elif nm != "scripts" and not stat.S_ISREG(est.st_mode):
-                findings.append(f"invalid layout: {nm!r} is not a regular file")
-        return findings
+        return None
 
     def _pending_scripts_verdict(self, pdir: Path) -> tuple[bool, dict] | None:
         """Cheap pre-approval validation verdict for the pending LIST path.
@@ -4243,15 +4221,17 @@ class SkillsLoader:
         list. Small, decodable scripts get the real ``validate_scripts`` run,
         matching the approve path's verdict.
 
-        Returns ``None`` on a platform without descriptor-relative opens: a
-        by-name walk here would be the exact hole the pinning closes, and an
-        unvalidated ``ok: true`` would suppress the badge's promise — the
-        caller omits the field instead, and the approve path remains the
-        authority at click time. Layout findings from the stat-only precheck
-        are still reported as a failing verdict on such platforms — refusing
-        is trustworthy without a pinned walk; only ``ok: true`` is not.
+        Returns ``None`` on a platform without descriptor-relative opens,
+        BEFORE any by-name layout scan. A link/junction check followed by a
+        by-name scan races with replacement of the candidate root: even a
+        refusal can expose the target's filenames. On Windows the pre-click
+        "fails validation" badge disappears entirely, because no trustworthy
+        verdict can be computed without descriptor-relative opens. The caller
+        omits the field; approve remains the authority at click time.
         """
         layout = self._candidate_layout_findings(pdir)
+        if layout is None:
+            return None
         if layout:
             return False, {"<candidate>": layout}
         sdir = pdir / "scripts"
@@ -4279,7 +4259,7 @@ class SkillsLoader:
         # and OMITS the verdict (see the breach return below) — never a false
         # refusal claim; the approve path remains the authority on the full
         # set.
-        max_files = 64
+        max_files = _PENDING_SCRIPT_MAX_ENTRIES
         max_depth = 8
         budget = {"files": 0, "bytes": 0, "breached": False}
         max_total_bytes = max_files * MAX_SCRIPT_BYTES
@@ -4572,17 +4552,45 @@ class SkillsLoader:
         return redact_backup
 
     def _redact_validation_report(self, report: dict) -> dict:
-        """Redact a ``validate_scripts`` report for exposure outside the log.
+        """Bound and redact reports at retention for every pending HTTP surface.
 
-        Filenames and finding strings can quote candidate content, and the
-        pending detail API already redacts everything it serves — the report
-        rides the same HTTP surfaces (approve refusals, pending detail/list),
-        so it gets the same treatment.
+        Keep at most the verdict's script-entry budget, with independently
+        bounded finding lists and strings. Redact BEFORE shortening strings:
+        cutting first could turn a credential into an unrecognised fragment.
+        One fixed summary reports omitted entries (including redacted-key
+        collisions), findings within retained entries, and characters within
+        retained strings. Entries beyond the population cap are never redacted
+        or copied.
         """
-        return {
-            self._redact_text(str(fn)): [self._redact_text(str(f)) for f in findings]
-            for fn, findings in report.items()
-        }
+        safe: dict[str, list[str]] = {}
+        omitted_entries = max(0, len(report) - _PENDING_SCRIPT_MAX_ENTRIES)
+        omitted_findings = 0
+        omitted_chars = 0
+        for fn, findings in islice(report.items(), _PENDING_SCRIPT_MAX_ENTRIES):
+            redacted_key = self._redact_text(str(fn))
+            key = redacted_key[:_VALIDATION_REPORT_MAX_STRING_CHARS]
+            # Redaction and shortening can collapse distinct filenames. Never
+            # overwrite a prior entry or let a filename steal the summary slot.
+            if key in safe or key == _VALIDATION_REPORT_TRUNCATION_KEY:
+                omitted_entries += 1
+                continue
+            omitted_chars += len(redacted_key) - len(key)
+            values: list[str] = []
+            omitted_findings += max(0, len(findings) - _VALIDATION_REPORT_MAX_FINDINGS)
+            for finding in islice(findings, _VALIDATION_REPORT_MAX_FINDINGS):
+                redacted = self._redact_text(str(finding))
+                value = redacted[:_VALIDATION_REPORT_MAX_STRING_CHARS]
+                omitted_chars += len(redacted) - len(value)
+                values.append(value)
+            safe[key] = values
+        if omitted_entries or omitted_findings or omitted_chars:
+            safe[_VALIDATION_REPORT_TRUNCATION_KEY] = [
+                "too large: validation report truncated; "
+                f"omitted {omitted_entries} script entries, "
+                f"{omitted_findings} findings from retained entries, "
+                f"{omitted_chars} characters from retained strings"
+            ]
+        return safe
 
     @staticmethod
     def _auto_slug_from_name(name: str) -> str:
