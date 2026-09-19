@@ -787,9 +787,7 @@ def run_launch(
                 job.status = RUNNING
                 s.state = STEP_DONE if signed else STEP_SKIPPED
                 s.detail = (
-                    "Signed in."
-                    if signed
-                    else "Not signed in yet — finish it from the dashboard."
+                    "Signed in." if signed else "Not signed in yet — finish it from the dashboard."
                 )
                 store.save(job)
             else:
