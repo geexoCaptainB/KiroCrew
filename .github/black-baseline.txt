@@ -127,7 +127,6 @@ src/kiro_crew/apps/builtins/personal_shopper/tests/test_routes.py
 src/kiro_crew/apps/builtins/personal_shopper/tests/test_store.py
 src/kiro_crew/apps/builtins/pptx_maker/backend/library.py
 src/kiro_crew/apps/builtins/workflows/server.py
-src/kiro_crew/apps/cron_sdk.py
 src/kiro_crew/apps/dependencies.py
 src/kiro_crew/apps/dependency_ledger.py
 src/kiro_crew/apps/dev_mode.py
