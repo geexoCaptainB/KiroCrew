@@ -101,6 +101,51 @@ Dashboard-user settings routes expose the union of registered channels and store
 
 `website/src/components/notifications/NotificationDetailPanel.tsx` and `NotificationFeed.tsx` render navigation actions only after `safeInternalUrl` rechecks a dashboard-internal URL. Unacknowledged approval notes render Approve and Reject controls that use the approval API. `NotificationFeed` collapses notes sharing a `group_key` within a date group to the newest row and expands the stack on demand. `NotificationsBellButton` sends the unread attention count through `badge:set`; `electron/badge.js` clamps it before `app.setBadgeCount`.
 
+## Plain-text previews
+
+The native notification body, feed-row preview and transcript turn minimap share
+`website/src/components/notifications/notifMeta.tsx::stripMd`. It unwraps paired
+emphasis and code delimiters, keeps code contents literal, and preserves unpaired
+markers and intraword underscores. Heading, blockquote and list prefixes (`-`,
+`+`, `*`, ordered) are removed only at line starts and only when whitespace
+follows the marker, so `*emphasis*` and `**bold**` at a line start are unwrapped
+as emphasis rather than deleted as bullets; links/images retain labels/alt text,
+and fenced code loses its language tag. A single prose newline collapses to a space; a
+paragraph break (two or more newlines, blank lines may hold whitespace) in prose
+becomes ` · ` — the detail panel's own separator idiom — so an approval reads
+`Source: agent · <command> · <purpose>` and a skill note's paragraphs stay
+distinct instead of running together. Empty paragraphs are dropped, so the
+separator never leads, trails or doubles. Whitespace inside code regions stays
+literal, including indentation, repeated spaces, tabs and blank lines; only the
+fence wrapper's final line ending is removed. A multiline command remains a
+multiline string in the preview. Backtick fences
+close only on a standalone run at least as long as their opening run; shorter
+runs inside code remain literal. An inline span pairs runs of EQUAL length, so a
+longer or shorter run inside one stays literal content. One deliberate deviation
+from CommonMark: a newline ends an unclosed inline span rather than continuing
+it, because in a preview a stray backtick would otherwise pair with another far
+below and hold every line between as code, suppressing flattening for that whole
+region — the deviation costs only multi-line inline spans, which no producer
+writes. Approval bodies use
+`website/src/lib/approvalNotificationBody.ts::approvalNotificationBody` to combine
+a formatted source label with a literal command in a fence longer than any
+backtick run in that command (minimum three). Empty input adds no fence. The
+live WebSocket event appends its optional purpose; reconciliation keeps its
+source-and-command-only content. This preserves balanced globs, home paths,
+redirects and command backticks in both previews. The feed slices the flattened
+text to 80/140 characters, so wrapper fences do not consume its excerpt budget;
+the detail panel renders the fenced input as one code block. That body is the
+only surface naming the requesting system: the detail panel's metadata row
+prints the note's kind (`KIND_META[...].label`) under the `pages.artifactsPage.kind`
+label, so its label and the body's `Source:` label are distinct fields.
+
+The shared contracts live in `website/src/test/notifMeta.stripMd.test.ts` (with
+the code-region scan in `website/src/test/notifMeta.codeScan.test.ts`) and
+`website/src/test/approvalNotificationBody.test.tsx`; native banner formatting is
+pinned in `website/integration/AppNotification.integration.test.tsx`. WebSocket
+producer coverage pins the differing purpose policies, and the feed tests pin
+both excerpt lengths.
+
 ## Notification sound (client)
 
 Notification sound is produced entirely on the client and is independent of the
