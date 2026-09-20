@@ -49,8 +49,13 @@ function names(list: string[]): string {
  * have to be rolled back on a failure, and the strip has an honest alternative:
  * the pair is disabled while the request is in flight, and a failure renders
  * beside it rather than silently reverting.
+ *
+ * Exported because a SECOND surface rates a decision: the mid-turn handling line
+ * on a user row (`SteerDecisionLine.tsx`). Shared rather than copied so the
+ * request, the retraction gesture, the in-flight disable and the failure notice
+ * cannot drift into two behaviours for one control.
  */
-function VerdictThumbs({
+export function VerdictThumbs({
   turnId,
   side,
   label,

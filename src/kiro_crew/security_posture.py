@@ -105,6 +105,21 @@ class PostureControl:
 # Where a sink runs only ONE of the two scanners, its detail text says so.
 _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
     (
+        "Mid-turn handling decisions",
+        "decisions/points/message_steer.py",
+        "The running turn's own request and its newest assistant text and tool "
+        "activity, sent to the third-party judge that decides whether a message "
+        "typed into that turn interrupts it or waits for the next one. Unlike the "
+        "gate above it, this module EMITS its redacted bytes: the cleaned excerpt "
+        "is what leaves the machine, because refusing on it would turn 'the reply "
+        "quoted an env file' into 'the seam stopped deciding'. Both scanners run, "
+        "in the order credential-then-URL, over the tail of each half before it is "
+        "clipped to the consented budget; a scanner that fails yields the empty "
+        "string rather than the input, and the gate's own scan still refuses the "
+        "whole request for a spelling this pass missed. Nothing else about the "
+        "turn is sent -- private reasoning is excluded at the read.",
+    ),
+    (
         "Member capability editor responses",
         "agent_capabilities.py",
         "Owner-facing capability rows, Parent-change previews and impact summaries. "

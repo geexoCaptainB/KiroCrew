@@ -141,14 +141,25 @@ class TestDecisionsSettingCrossLayer:
         assert callable(handlers.api_decisions_consent_get)
         assert callable(handlers.api_decisions_consent_put)
 
-    def test_the_frontend_live_point_is_a_point_the_backend_ships(self):
+    def test_every_frontend_point_is_a_point_the_backend_ships(self):
+        """Each identifier the frontend spells has to be one the gate admits.
+
+        Set MEMBERSHIP, and it is checked in BOTH directions: a frontend spelling
+        the gate does not admit is a record nobody renders, and a point the gate
+        ships that no frontend constant names is a decision with no surface. An
+        equality against a tuple would additionally pin the ORDER, which nothing
+        reads and which a third point would break for no reason.
+        """
         from kiro_crew.decisions.gate import DECISION_POINT_NAMES
 
-        point = _ts_const(DECISIONS_READER_PATH.read_text(encoding="utf-8"), "DECISIONS_LIVE_POINT")
-        assert (
-            point,
-        ) == DECISION_POINT_NAMES, (
-            f"the card's point {point!r} differs from backend point names {DECISION_POINT_NAMES}"
+        source = DECISIONS_READER_PATH.read_text(encoding="utf-8")
+        named = {
+            _ts_const(source, "DECISIONS_LIVE_POINT"),
+            _ts_const(source, "DECISIONS_STEER_POINT"),
+        }
+        assert named == set(DECISION_POINT_NAMES), (
+            f"the frontend points {sorted(named)} differ from the backend's "
+            f"{sorted(DECISION_POINT_NAMES)}"
         )
 
 

@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 #: Decision points this build ships; an absent name is refused. Lives with the
 #: seam, not in ``config.sections``: nothing in the config is keyed by point name,
 #: and keeping it here keeps the config loader off a hot path's import graph.
-DECISION_POINT_NAMES = ("skills.select",)
+DECISION_POINT_NAMES = ("skills.select", "message.steer")
 
 #: The model id sent when the config leaves ``provider.model`` empty -- the same
 #: fallback ``impl_jev`` applies, so the id the scrub clears is the id sent.
