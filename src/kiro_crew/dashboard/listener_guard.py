@@ -44,13 +44,19 @@ Two detectors feed one recovery path:
   the failure mode leaves the process alive and its accepted connections
   ESTABLISHED.
 
-Recovery stops the dead ``TCPSite`` (``server.close()`` + unregister -- the
+Recovery releases the dead listener (``Server.close()`` + unregister -- the
 accepted connections are untouched), creates a fresh ``TCPSite`` on the same
 host and the port that was really bound, and starts it. Rebinding succeeds on
 Windows with the old accepted connections still open (verified; a LISTEN
 socket has no TIME_WAIT). Bind failures retry with exponential backoff up to
-``max_attempts``; after that the guard records :data:`LISTENER_LOST_EXIT_CODE`
-and sets the process-wide shutdown event so the gateway exits non-zero.
+``max_attempts``.
+
+Two ways out lead to :data:`LISTENER_LOST_EXIT_CODE` and the process-wide
+shutdown event, so the gateway exits non-zero rather than idling unreachable:
+binding keeps failing, or a probe-triggered rebind BINDS yet the probe still
+gets no answer ``max_unverified`` times in a row. The second exists because a
+rebind cures a closed listener and cannot cure one that is open but serving
+nothing -- exactly the state only the HTTP probe detects.
 """
 
 from __future__ import annotations
@@ -78,10 +84,10 @@ ACCEPT_FAILED_MESSAGE = "Accept failed on a socket"
 LISTENER_LOST_EXIT_CODE = 69
 
 #: Seconds between periodic self-probes. The exception hook reacts instantly to
-#: the CPython path above; the probe covers the one case that hook cannot see --
-#: another component calling ``loop.set_exception_handler`` after the guard
-#: armed displaces the hook, and then only a probe observes the closed
-#: listener. So it can be slow.
+#: the CPython path above; the probe covers the two states that hook cannot
+#: report -- a listener that is OPEN yet answers nothing (a wedged application,
+#: loopback blocked), and a hook displaced by a later
+#: ``loop.set_exception_handler`` call. Neither is urgent, so it can be slow.
 DEFAULT_PROBE_INTERVAL_SECS = 60.0
 #: Seconds before a failed probe is re-confirmed. A single probe can lose a race
 #: against a momentarily saturated accept queue; a dead listener fails twice.
@@ -90,6 +96,11 @@ DEFAULT_CONFIRM_DELAY_SECS = 2.0
 DEFAULT_PROBE_TIMEOUT_SECS = 5.0
 #: Rebind attempts per incident before giving up and exiting.
 DEFAULT_MAX_REBIND_ATTEMPTS = 5
+#: Consecutive probe-triggered rebinds that may end with the probe STILL failing
+#: before the guard stops rebinding and exits instead. A rebind cures a closed
+#: listener; it cannot cure one that binds fine and answers nothing, so that
+#: state has to reach the supervisor rather than churn the listener forever.
+DEFAULT_MAX_UNVERIFIED_RECOVERIES = 3
 #: First backoff delay; doubles per failed attempt, capped at
 #: :data:`DEFAULT_MAX_BACKOFF_SECS`.
 DEFAULT_BACKOFF_BASE_SECS = 0.5
@@ -166,6 +177,38 @@ def _listening_sockets(site: web.TCPSite) -> tuple[Any, ...]:
     return tuple(getattr(server, "sockets", None) or ())
 
 
+def release_site(site: web.TCPSite) -> None:
+    """Close *site*'s LISTEN socket and unregister it, without ``TCPSite.stop``.
+
+    ``stop()`` is deliberately not used. Across this project's declared
+    ``aiohttp>=3.9,<4`` range it is not a listener-only operation: on 3.9 and
+    3.10 it also runs the application's ``on_shutdown`` signals and then waits
+    up to the runner's shutdown timeout (60s by default) for every ACCEPTED
+    connection to finish. Neither belongs to releasing a port: the guard's
+    rebind keeps the application serving, and the boot retry has an application
+    that has not started serving yet.
+
+    Closing the asyncio ``Server`` is the whole of what a release needs: it
+    frees the LISTEN socket and leaves accepted connections alone. Tolerant of
+    a half-started site (``start()`` raised, so it is registered with no
+    server) and of one already unregistered.
+    """
+    server = site._server
+    if server is not None:
+        try:
+            server.close()
+        except Exception:
+            logger.debug("closing the dead listener socket raised", exc_info=True)
+    sites = getattr(getattr(site, "_runner", None), "_sites", None)
+    if sites is None:
+        return
+    try:
+        if site in sites:
+            sites.remove(site)
+    except Exception:
+        logger.debug("unregistering the dead listener site raised", exc_info=True)
+
+
 class ListenerGuard:
     """Watch one ``TCPSite`` and rebind it when its listener dies.
 
@@ -185,6 +228,7 @@ class ListenerGuard:
         max_attempts: int = DEFAULT_MAX_REBIND_ATTEMPTS,
         backoff_base: float = DEFAULT_BACKOFF_BASE_SECS,
         max_backoff: float = DEFAULT_MAX_BACKOFF_SECS,
+        max_unverified: int = DEFAULT_MAX_UNVERIFIED_RECOVERIES,
         probe: Callable[..., Any] | None = None,
     ) -> None:
         self._runner = runner
@@ -196,6 +240,7 @@ class ListenerGuard:
         self._max_attempts = max(1, max_attempts)
         self._backoff_base = backoff_base
         self._max_backoff = max_backoff
+        self._max_unverified = max(1, max_unverified)
         self._probe = probe if probe is not None else http_probe
         # Bind parameters are captured from the live site so the rebind lands on
         # the SAME host and the port that was REALLY bound (``--port auto`` binds
@@ -212,6 +257,7 @@ class ListenerGuard:
         self._recover_task: asyncio.Task[bool] | None = None
         self._stopped = False
         self._exit_code = 0
+        self._unverified_recoveries = 0
         self.recoveries = 0
 
     # ── public surface ───────────────────────────────────────────────────
@@ -229,6 +275,11 @@ class ListenerGuard:
     def exit_code(self) -> int:
         """:data:`LISTENER_LOST_EXIT_CODE` once the guard gave up, else ``0``."""
         return self._exit_code
+
+    @property
+    def unverified_recoveries(self) -> int:
+        """Consecutive probe-triggered rebinds after which the probe still failed."""
+        return self._unverified_recoveries
 
     def arm(self, loop: asyncio.AbstractEventLoop | None = None) -> None:
         """Hook the loop's exception handler and start the periodic self-probe."""
@@ -323,14 +374,22 @@ class ListenerGuard:
                 pass
             if self._stopped or await self._probe_once():
                 continue
-            await self._recover("loopback HTTP self-probe failed twice")
+            await self._recover("loopback HTTP self-probe failed twice", verify=True)
 
     async def _probe_once(self) -> bool:
         target = self._current_target()
         if target is None:
             return False
         host, port = target
-        return bool(await self._probe(host, port, timeout=self._probe_timeout))
+        answered = bool(await self._probe(host, port, timeout=self._probe_timeout))
+        if answered:
+            # A listener that answers ends the futile-rebind streak, whoever
+            # probed. The escalation counts CONSECUTIVE rebinds that fixed
+            # nothing, so separated incidents that each healed on their own
+            # must not accumulate toward the exit -- that would exit a
+            # recovered gateway.
+            self._unverified_recoveries = 0
+        return answered
 
     def _current_target(self) -> tuple[str, int] | None:
         sockets = _listening_sockets(self._site)
@@ -343,7 +402,7 @@ class ListenerGuard:
 
     # ── recovery ──────────────────────────────────────────────────────────
 
-    async def _recover(self, reason: str) -> bool:
+    async def _recover(self, reason: str, *, verify: bool = False) -> bool:
         if self._stopped or self._shutdown_event.is_set():
             return False
         logger.critical(
@@ -356,12 +415,12 @@ class ListenerGuard:
         for attempt in range(1, self._max_attempts + 1):
             if self._stopped or self._shutdown_event.is_set():
                 return False
-            await self._stop_site(self._site)
+            release_site(self._site)
             new_site = self._new_site()
             try:
                 await new_site.start()
             except OSError as exc:
-                await self._stop_site(new_site)
+                release_site(new_site)
                 delay = min(self._backoff_base * (2 ** (attempt - 1)), self._max_backoff)
                 logger.error(
                     "Listener rebind attempt %d/%d failed: %s -- retrying in %.1fs",
@@ -385,20 +444,57 @@ class ListenerGuard:
                 attempt,
                 self.recoveries,
             )
+            if verify:
+                return await self._verify_recovery()
             return True
 
-        self._exit_code = LISTENER_LOST_EXIT_CODE
-        logger.critical(
-            "Gateway listener on %s:%d could not be rebound after %d attempts; "
-            "exiting with status %d so the supervisor restarts the gateway "
-            "instead of leaving it alive and unreachable",
+        self._give_up(f"rebinding failed {self._max_attempts} time(s) in a row")
+        return False
+
+    async def _verify_recovery(self) -> bool:
+        """Re-probe after a probe-triggered rebind; escalate once rebinding is futile.
+
+        A rebind cures a CLOSED listener. It cannot cure a listener that binds
+        fine and still answers nothing -- a wedged application, loopback
+        blocked -- which is the one state the HTTP probe detects and
+        :meth:`listener_open` does not. Without this check that state would
+        stop and rebind the listener every ``interval`` for the life of the
+        process, dropping the backlog each time and never reaching the exit
+        that hands the problem to the supervisor.
+        """
+        if await self._probe_once():
+            return True
+        self._unverified_recoveries += 1
+        logger.error(
+            "Rebound listener on %s:%d still does not answer %s "
+            "(%d/%d consecutive rebinds that fixed nothing)",
             self._host or "*",
             self._port,
-            self._max_attempts,
+            _PROBE_PATH,
+            self._unverified_recoveries,
+            self._max_unverified,
+        )
+        if self._unverified_recoveries >= self._max_unverified:
+            self._give_up(
+                f"the listener rebound {self._unverified_recoveries} time(s) and still "
+                f"does not answer {_PROBE_PATH}, so rebinding cannot fix it"
+            )
+            return False
+        return True
+
+    def _give_up(self, reason: str) -> None:
+        """Record the non-zero exit status and ask the process to shut down."""
+        self._exit_code = LISTENER_LOST_EXIT_CODE
+        logger.critical(
+            "Gateway listener on %s:%d cannot be restored (%s); exiting with "
+            "status %d so the supervisor restarts the gateway instead of "
+            "leaving it alive and unreachable",
+            self._host or "*",
+            self._port,
+            reason,
             LISTENER_LOST_EXIT_CODE,
         )
         self._shutdown_event.set()
-        return False
 
     def _new_site(self) -> web.TCPSite:
         # shutdown_timeout is deliberately not forwarded: aiohttp owns it on the
@@ -412,22 +508,6 @@ class ListenerGuard:
             reuse_address=self._reuse_address,
             reuse_port=self._reuse_port,
         )
-
-    async def _stop_site(self, site: web.TCPSite) -> None:
-        """Release *site*'s server and registration; tolerant of a half-started site.
-
-        ``TCPSite.stop`` only closes the asyncio ``Server`` (the LISTEN socket;
-        accepted connections stay up) and unregisters the site from the
-        runner. A site whose ``start()`` raised is registered but has no
-        server, and one already unregistered raises ``RuntimeError`` -- both
-        are expected here and must not abort the rebind.
-        """
-        try:
-            await site.stop()
-        except RuntimeError:
-            pass  # the site is absent from the runner
-        except Exception:
-            logger.debug("stopping the dead listener site raised", exc_info=True)
 
     @staticmethod
     def _bound_port(site: web.TCPSite) -> int:

@@ -128,7 +128,7 @@ from kiro_crew.dashboard.handlers.source_providers import (
 from kiro_crew.dashboard.handlers.spawn_resume import setup_spawn_resume_routes
 from kiro_crew.dashboard.handlers.weixin_qr import setup_weixin_routes
 from kiro_crew.dashboard.handlers.whatsapp_setup import setup_whatsapp_routes
-from kiro_crew.dashboard.listener_guard import ListenerGuard
+from kiro_crew.dashboard.listener_guard import ListenerGuard, release_site
 from kiro_crew.dashboard.loop_watchdog import LoopStallWatchdog
 from kiro_crew.dashboard.origin import (
     AUDIT_CLAIMED_KEY,
@@ -2095,8 +2095,11 @@ async def _start_site(
             if exc.errno != errno.EADDRINUSE:
                 raise
             last_exc = exc
-            # release the partially-started site before retrying
-            await site.stop()
+            # release the partially-started site before retrying, listener only:
+            # TCPSite.stop() would also fire the application's on_shutdown
+            # signals and wait on the runner's shutdown timeout, and this
+            # application has not started serving yet (see release_site).
+            release_site(site)
             if attempt == 0:
                 try:
                     outcome = await _reclaim(port)

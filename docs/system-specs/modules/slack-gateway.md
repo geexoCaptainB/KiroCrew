@@ -184,6 +184,23 @@ fence and final yield-free drain-to-exec handoff apply to both launch paths.
    modes, then `cleanup_orphaned_sessions()` kills any kiro-cli PIDs tracked in
    the PID file before `os._exit(0)`.
 
+**Self-initiated exits carry a non-zero status.** `_shutdown_and_exit` composes
+`shutdown_exit_code(watchdog) or listener_guard_exit_code(...)`, so an operator
+stop still exits 0 while a shutdown the gateway asked for itself does not —
+a restart-on-failure supervisor never relaunches an exit 0:
+
+| Status | Source | Meaning |
+| --- | --- | --- |
+| 0 | operator (SIGTERM, `systemctl stop`, Ctrl+C) | stay down as asked |
+| 75 (`EX_TEMPFAIL`) | stale-asset watchdog | the served assets vanished |
+| 69 (`EX_UNAVAILABLE`) | listener guard (`dashboard/listener_guard.py`) | the TCP listener could not be restored, so the process was alive but unreachable |
+
+The listener-guard path is Windows-only in practice: CPython's proactor loop
+closes the LISTEN socket after one failed `accept()` and never re-arms it. The
+guard rebinds first and only sets this status when rebinding keeps failing, or
+when the rebind binds yet the loopback `/api/live` probe still gets no answer —
+a state no rebind can fix.
+
 ### Event-loop stall watchdog & blocking-work executors
 
 The gateway runs a single asyncio loop, so any blocking call on the loop thread freezes the whole backend. App Home skill loader construction and listing run together in a worker: listing can initialize/read the persistent SQLite metadata index. Two mechanisms contain this (see `dashboard/loop_watchdog.py`, `executors.py`):

@@ -50,9 +50,12 @@ async def _live(_request: web.Request) -> web.Response:
 class _Served:
     """A real aiohttp server on an ephemeral loopback port plus its guard."""
 
-    def __init__(self, **guard_kwargs: Any) -> None:
+    def __init__(self, *, on_shutdown: Any = None, **guard_kwargs: Any) -> None:
         self.app = web.Application()
         self.app.router.add_get("/api/live", _live)
+        if on_shutdown is not None:
+            # Registered before ``runner.setup()``: the signal is frozen after.
+            self.app.on_shutdown.append(on_shutdown)
         self.runner = web.AppRunner(self.app)
         self.shutdown = asyncio.Event()
         self._guard_kwargs = guard_kwargs
@@ -305,6 +308,152 @@ async def test_gives_up_with_nonzero_exit_and_shutdown_when_rebind_keeps_failing
 
 
 @pytest.mark.asyncio
+async def test_probe_that_stays_unanswered_escalates_instead_of_rebinding_forever() -> None:
+    """A listener that binds and still answers nothing must reach the exit.
+
+    A rebind cures a CLOSED listener. It cannot cure one that binds fine and
+    serves nothing (a wedged application, loopback blocked) -- the single state
+    the HTTP probe detects and ``listener_open()`` does not. Without a
+    post-rebind check every rebind "succeeds", so the guard would stop and
+    rebind the listener every interval for the life of the process, dropping
+    the backlog each time, and the promised exit would be unreachable.
+    """
+
+    async def _never_answers(host: str, port: int, *, timeout: float) -> bool:
+        return False
+
+    async with _Served(
+        interval=0.02,
+        confirm_delay=0.01,
+        max_unverified=2,
+        probe=_never_answers,
+    ) as served:
+        guard = served.guard
+        assert guard is not None
+        guard.arm()
+        await _wait_until(served.shutdown.is_set, timeout=10.0)
+        assert guard.exit_code == LISTENER_LOST_EXIT_CODE
+        assert listener_guard_exit_code(guard) == LISTENER_LOST_EXIT_CODE
+        # Bounded: exactly the allowed rebinds happened, not an endless churn.
+        assert guard.unverified_recoveries == 2
+        assert guard.recoveries == 2
+
+
+@pytest.mark.asyncio
+async def test_verified_recovery_resets_the_escalation_counter() -> None:
+    """A rebind the probe then confirms must not count towards giving up.
+
+    Each cycle probes three times: the detection, the confirmation, and the
+    post-rebind verification. Two incidents whose rebind fixed nothing sit
+    either side of one that worked; without the reset the third would be the
+    second consecutive failure and would wrongly exit a serving process.
+    """
+    answers = iter(
+        [
+            False,
+            False,
+            False,  # incident 1: rebound, still unanswered
+            False,
+            False,
+            True,  # incident 2: rebound and verified -> reset
+            False,
+            False,
+            False,  # incident 3: unanswered again, but only #1 now
+        ]
+    )
+
+    async def _scripted(host: str, port: int, *, timeout: float) -> bool:
+        return next(answers, True)
+
+    async with _Served(
+        interval=0.02, confirm_delay=0.01, max_unverified=2, probe=_scripted
+    ) as served:
+        guard = served.guard
+        assert guard is not None
+        guard.arm()
+        await _wait_until(lambda: guard.recoveries >= 3, timeout=10.0)
+        await asyncio.sleep(0.1)
+        assert guard.exit_code == 0
+        assert not served.shutdown.is_set()
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_probe_between_incidents_resets_the_escalation_counter() -> None:
+    """A listener that answers again ends the futile-rebind streak.
+
+    The escalation counts CONSECUTIVE rebinds that fixed nothing. Separated
+    incidents that each healed on their own must not accumulate towards it:
+    counting them would exit a gateway that is serving. The healthy cycle here
+    carries no rebind of its own, so only a periodic probe can clear the count.
+    """
+    answers = iter(
+        [
+            False,
+            False,
+            False,  # incident 1: rebound, its own verify probe still failed
+            True,  # a later cycle finds the listener answering again
+            False,
+            False,
+            False,  # incident 2: unanswered again -- but the streak restarted
+        ]
+    )
+
+    async def _scripted(host: str, port: int, *, timeout: float) -> bool:
+        return next(answers, True)
+
+    async with _Served(
+        interval=0.02, confirm_delay=0.01, max_unverified=2, probe=_scripted
+    ) as served:
+        guard = served.guard
+        assert guard is not None
+        guard.arm()
+        await _wait_until(lambda: guard.recoveries >= 2, timeout=10.0)
+        await asyncio.sleep(0.1)
+        assert guard.exit_code == 0
+        assert not served.shutdown.is_set()
+
+
+@pytest.mark.asyncio
+async def test_recovery_never_calls_site_stop(monkeypatch: Any) -> None:
+    """Recovery releases the listener itself rather than delegating to ``TCPSite.stop``.
+
+    ``stop()`` is not listener-only across the declared ``aiohttp>=3.9,<4``
+    range: on 3.9/3.10 it also runs the application's ``on_shutdown`` signals
+    and waits up to the runner's shutdown timeout for every ACCEPTED
+    connection. A rebind routed through it would tear down the application it
+    is trying to keep serving, and one long-lived connection would stall it.
+    """
+    fired: list[str] = []
+
+    async def _on_shutdown(_app: web.Application) -> None:
+        fired.append("app")
+
+    async def _forbidden_stop(self: web.TCPSite) -> None:
+        raise AssertionError("recovery must not call TCPSite.stop")
+
+    async with _Served(interval=3600, on_shutdown=_on_shutdown) as served:
+        guard = served.guard
+        assert guard is not None
+        guard.arm()
+        dead = guard.site
+        # A live client connection the rebind must neither wait for nor drop.
+        held = socket.create_connection(("127.0.0.1", served.port), timeout=2.0)
+        monkeypatch.setattr(guard, "listener_open", lambda: False)
+        monkeypatch.setattr(web.TCPSite, "stop", _forbidden_stop, raising=False)
+        try:
+            assert await guard.check_now("test") is True
+        finally:
+            # Undone inside the context: runner.cleanup() below stops the sites.
+            monkeypatch.undo()
+            held.close()
+        assert guard.site is not dead
+        assert dead not in served.runner.sites
+        assert await _get_live(served.port) == 200
+        # The application itself was never shut down by the rebind.
+        assert fired == []
+
+
+@pytest.mark.asyncio
 async def test_recovery_declines_once_shutdown_requested(monkeypatch: Any) -> None:
     async with _Served(interval=3600) as served:
         guard = served.guard
@@ -457,14 +606,46 @@ def test_gateway_shutdown_consults_listener_guard_exit_code() -> None:
     assert LISTENER_LOST_EXIT_CODE not in (0, STALE_ASSET_EXIT_CODE)
 
 
-def test_gateway_exit_path_reads_the_listener_guard() -> None:
-    """The orchestrator's shutdown really consults the guard (pins the wiring)."""
+def test_gateway_exit_path_composes_both_exit_codes() -> None:
+    """The orchestrator's status is ``watchdog or guard`` -- pin the composition.
+
+    A substring check for ``listener_guard_exit_code`` survives turning that
+    ``or`` into an ``and``, which would make a listener-loss shutdown exit 0
+    and leave a restart-on-failure supervisor with nothing to relaunch. So
+    assert the boolean shape, not the mention.
+    """
+    import ast
     import inspect
+    import textwrap
 
     from kiro_crew.slack import gateway as gw
 
-    source = inspect.getsource(gw.GatewayOrchestrator._shutdown_and_exit)
-    assert "listener_guard_exit_code" in source
+    source = textwrap.dedent(inspect.getsource(gw.GatewayOrchestrator._shutdown_and_exit))
+
+    def _callee(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                return func.id
+            if isinstance(func, ast.Attribute):
+                return func.attr
+        return None
+
+    or_nodes = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or)
+    ]
+    composed = [
+        node
+        for node in or_nodes
+        if {"shutdown_exit_code", "listener_guard_exit_code"}
+        <= {name for value in node.values if (name := _callee(value)) is not None}
+    ]
+    assert composed, (
+        "_shutdown_and_exit must combine shutdown_exit_code() and "
+        "listener_guard_exit_code() with `or`"
+    )
 
 
 def test_both_gateway_entrypoints_arm_the_listener_guard() -> None:
