@@ -722,3 +722,79 @@ corpus, one auth declaration, one install probe, one mirror class, and the three
 per-backend sites in `acp/client.py` that every harness has extended — the spawn arm,
 the spawn label and the stderr label. Those three are the only recurring edit points
 left that a membership set does not already absorb.
+
+## Worked example: the Custom ACP harness
+
+The run to read for a harness that is NOT one harness. `ACP_BACKEND_CUSTOM` is an
+id whose launch facts arrive from `config.json` rather than from this repository:
+the operator names a command that serves ACP over stdio, its arguments, and the
+`configOptions` id and value that make it ask before it acts. It exists so that
+trying a harness this core has not onboarded is a config edit rather than a fork,
+and it is shaped so that the edit cannot put an ungated harness on the switch.
+
+| Stage | State |
+|---|---|
+| 1 vocabulary | Done — `ACP_BACKEND_CUSTOM`, in `ACP_BACKENDS_KNOWN`, `PROVIDER_LABEL_CUSTOM`, policy name mapped, its own model-registry namespace. Known at IMPORT so a governance rule can deny it before any deployment configures one. |
+| 2 capability sets | Decided for every set, and every decision is the same one for the same reason: **not a member, because nothing is known.** Two harnesses configured on two days both run under this id, so no capture could stand for the class, and a membership is a claim about a class. The cost of that honesty is real and stated: no spec translation, no model push, no steer, no compaction, no session sharing. A harness that does any of those is onboarded as a NAMED backend, where the evidence has somewhere to live. |
+| 3 spawn path | Done, and almost entirely borrowed. The spec is turned into a `SelfServedLaunch` row — `command` as the binary, `args` as the ACP args, no override variable (the command field already takes an absolute path), protocol version `1` — and written into `ACP_BACKEND_LAUNCH` at config load, so `_resolve_self_served_launch` answers for it exactly as for opencode. One thing the shared path did not have and now does: the resolution cache is keyed to the launch record that produced it (`_self_served_bin_cache_records`), so an operator who changes the command gets the new command on the next spawn rather than the old path until a restart. The client arm (`acp/client.py`) is the opencode arm minus its seed and read-back: resolve, refuse-then-mask preflight, spawn. |
+| 4 handshake | Integer `1`, by REQUIREMENT rather than capture: `configOptions` — the gate the harness must advertise — is defined in ACP v1, so a harness that can be gated at all speaks that dialect. |
+| 5 auth declaration | Done — `own_credential_file` in the sense that the host store is not what it reads; `credential_leaves=()`, `adapter_own_leaves=()`. The empty tuples are the honest declaration and their consequences are written into the declaration itself: a token kept outside the floor is readable by the agent's file tools like any other file, and the child reads NONE of the masked credential homes, so a harness that authenticates from `~/.aws` cannot sign in under this id. |
+| 6 install probe | Done — `_probe_custom`, a probe of its own because the generated self-served rows are bound at import and this harness's row is not there yet. Unconfigured: `missing`, with the CONFIG BLOCK as the component, since naming a binary would name one Crew invented. Configured: `_probe_self_served` over the configured command, with an install command that says where the command came from rather than pretending to know an installer. |
+| 7 selectability | **Conditional.** Outside `BASELINE_SELECTABLE_BACKENDS` and named in `NOT_SHIPPED_SELECTABLE`, because at import there is no command and no gate. `register_custom_backend` (`agent_sdk/backends.py`) is the ONE writer: it writes the launch row and the permission pair and rewrites the routing row from `UNVERIFIED` (its state at import, held explicitly so the routing census covers every known id) to `SESSION_CONFIG`, then calls `register_selectable_backend`, which re-checks the routing it now finds. A `None` or incomplete spec unregisters instead — the routing row goes back to `UNVERIFIED` — so a blanked block takes the id off the switch on the next load and a persisted `acp_backend: "custom"` degrades through the one gate every unusable value takes. Called from `config/loader.py::_build_agent_config` BEFORE `acp_backend` is normalized, which is the ordering that lets a persisted `"custom"` survive the load. |
+| routing | `SESSION_CONFIG`, always. The mechanism needs no harness-specific code because ACP v1 defines it, and it is the one this core ENFORCES: `_apply_session_permission_routing` runs on the ordinary `_initialize_session` path for every `SESSION_CONFIG` harness, verifies the option is advertised, applies it, and refuses the session with the option named otherwise. So "Custom" means *any harness that can be gated through a config option*, not any harness — a harness with no such option fails to start with the reason shown, which is the correct product framing and the property the whole registry is built around. **Same mechanism as codex, different provenance, and every surface says so:** for codex this repository chose the option pair after reading what it does; for this id the OPERATOR chose it, and what Crew verifies — advertised, accepted — is the same in both cases while what it cannot verify for an arbitrary harness is that the value MEANS "ask before acting". `routing_verdict` returns ROUTED with a reason that names the attestation, the dashboard form states it beside the Save button, and the attestation is then OBSERVED rather than trusted: `_tripwire_custom_gate` (`acp/client.py`, the pi gate's tripwire re-keyed on plain `session/request_permission` frames) kills the harness and fails the turn on a `tool_call_update` that reaches `completed` for a call no permission frame asked about, or for one the host DENIED, naming the option the operator configured. Calls whose own `tool_call` frame declared a passive kind (`read`/`search`/`think`) are tolerated — the line codex is held to, since passive reads bypass the gate on every `SESSION_CONFIG` harness and the OS credential mask compensates — while an undeclared kind and `fetch` are held to asking. The first unasked call has already run when the wire trips; what the tripwire guarantees is that it is the last. The tracking behind it holds only calls in flight (a terminal `tool_call_update` releases its id) and is bounded by `_CUSTOM_GATE_MAX_INFLIGHT`: a harness with more calls open than that is stopped too, so a harness that opens calls it never finishes cannot grow the gateway's memory. |
+| policy | A governance denial of this id HOLDS ACROSS CONFIG RELOADS. The registrar runs on every `KiroCrewConfig.load()`, and the first cut of `register_selectable_backend` wrote the effective set unconditionally — correct while every registrar ran at bootstrap, before the first policy pass, and a bypass the moment one ran after it: a denied `custom` came back on the switch at the next load and stayed until the next ceiling swap. The leaf now remembers the last pass's denied set (`_denied`, written by `apply_selectable_denials`) and a registration that follows a denial writes the BASELINE only, so the id is not lost to the next recompute and is not selectable before it. Pinned by `test_a_config_reload_cannot_undo_a_policy_denial`. |
+| MCP projection | `no-channel`, in `providers/mirrors/registry.py`. The shared mirror-less append still puts the pooled broker stubs on the session's array, and the harness may mount, ignore or refuse them; Crew CLAIMS none of the three. The card therefore says a custom session may hold none of Crew's tools, which is the one statement true of every harness this id can name. What would move a harness off this id is the same measurement every named harness carries: a stdio element that round-trips. |
+| residual | Everything a named harness's corpus would have established and this one cannot: what the harness does with the array, where it keeps its credential, and — before the first tool call — whether the gate the operator named actually raises `session/request_permission`; the tripwire converts that last one into an in-band observation at the cost of the first unasked action. **The passive-kind tolerance rests on the harness's own labels.** For codex the repository read what `read`/`search`/`think` mean; for this id the labels come from the very harness whose attestation the tripwire observes, and nobody verified them. So a call the harness labels passive, or never reports as a `tool_call` at all, is INVISIBLE to the tripwire, and the OS credential mask is the only control on it — the attestation text (form, config help, this row) says so in as many words rather than implying the tripwire sees everything. Holding reads to asking was rejected: it would kill any read-only-mode harness on its first read, which is the mode the gate is asking for. Each is written down where the operator reads it — the card, the auth remedy, the install row, the form — rather than assumed. The args are the operator's and may carry a token, so the launch record marks them `args_are_operator_supplied` and `spawn_label` — the string both the registration line and the `Spawned … (PID …)` line log — carries the executable's basename and the arg COUNT, never the args or the gate pair; the form says the same and adds that the args appear in the process list. |
+| 8 live spill | The dashboard's Agent Backend panel gains a form on this harness's card (command, arguments, gate option, gate value), written as ONE record through `PATCH /api/config` on `agent.custom_acp` — owner-only, because the record names a program the gateway will execute — and read back through the ordinary `GET /api/acp-backends` row, whose install verdict and selectability answer whether the write produced a usable harness. |
+
+**Where the record lives, and where it would move.** `agent.custom_acp` is ONE
+harness, named in config, and that is the whole of what this id promises. A wider
+shape exists as a proposal: a descriptor file (`harnesses.json`) that names many
+harnesses, each with its own command and gate, selectable per chat and per
+subagent. Should that land, this record is its first entry: `command`, `args`,
+`gate_option`, `gate_value` are the four fields any descriptor of a
+`SESSION_CONFIG` harness must carry, so the migration is a move, not a rewrite —
+config load reads the single block, or the descriptor's entries, and calls the same
+`register_custom_backend` per harness; the `custom` id becomes the first of N ids
+minted the same way; nothing about the gate, the tripwire, the SEL redaction or the
+owner-only write changes, because none of it keys on where the four values came
+from. What the descriptor would ADD is the per-chat selection surface, which this
+block deliberately does not have. Until it lands, this block is the shipped path,
+and a build that reads a descriptor honours a populated `agent.custom_acp` as
+entry zero rather than refusing it.
+
+**The gate is armed from a copy the spawn took, not from the table.** The one
+writer of this id's rows is config load, and config load can run again while a
+process is between spawn and `session/new`. A reload that unregisters the harness
+at that moment empties the routing row, and every table-keyed question
+(`routing_for`, `session_config_issue`, `is_enforced`) then answers "nothing
+declared" for a process that is already running — which, read naively, is "nothing
+to arm", and the first prompt runs ungated. So the custom spawn arm copies the
+`(gate_option, gate_value)` pair beside the launch record it just resolved, and
+`_initialize_session` arms from that copy through `config_option_issue` (the
+table-free half of `session_config_issue`); a copy that fails to arm refuses the
+session outright instead of consulting `is_enforced`, and a custom process with no
+copy is refused rather than fallen through. The pattern to carry: a harness whose
+rows can vanish under a running process must have that process hold the facts it
+was started with.
+
+Two things this run produced that the checklist did not ask for.
+
+**The first is a harness whose facts are written at load rather than at import.**
+Every table in the leaf was built on the assumption that a row is a literal, and
+four import-time derivations read those rows — the tool-gate label, the protocol
+dialect, the install-probe table and `ACP_BACKENDS_SELF_SERVED_ACP`. Each keeps a
+STATIC row for this id (its label and dialect are fixed; its probe is its own) and
+the derived set is documented as the per-build enumeration it always was, with the
+live question — "is there a launch row right now?" — asked of the table itself. The
+pattern to carry: a harness with a runtime row keeps import-time enumerations
+honest by holding a static row in each, never by mutating a frozenset.
+
+**The second is the cache invalidation the shared path never needed.** Every
+self-served harness resolves its binary once per process, and every one of them
+could afford that because its binary name never changes. This one's does. Rather
+than a custom-only branch, the cache now remembers the launch record each entry
+was resolved for and drops the entry when the record differs — a rule that is a
+no-op for every fixed harness and correct for the one that moves. Expect this too:
+a harness whose facts come from outside the repository finds the places where
+"once per process" was quietly standing in for "never changes".

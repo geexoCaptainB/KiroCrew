@@ -47,6 +47,7 @@ from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import STOP_REASON_END_TURN
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CUSTOM,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
@@ -244,7 +245,11 @@ class TestEveryKnownBackendIsClassified:
     #: * ``pi``, ``goose`` -- their source says they compact inline; no driven capture
     #:   confirms it, which is the bar ``ACP_BACKENDS_COMPACT`` holds members to. The
     #:   capture is tracked as deferred follow-up work.
-    UNCLASSIFIED = frozenset({ACP_BACKEND_PI, ACP_BACKEND_GOOSE})
+    #: * ``custom`` -- an operator-named harness. Nothing is known about how it bounds
+    #:   its context, and no capture can be taken ahead of time for a command Crew
+    #:   has never seen, so it takes the warning arm on purpose: it declines, and the
+    #:   gate logs which decision is missing rather than guessing one.
+    UNCLASSIFIED = frozenset({ACP_BACKEND_PI, ACP_BACKEND_GOOSE, ACP_BACKEND_CUSTOM})
 
     def test_every_known_backend_is_classified_or_listed(self) -> None:
         classified = (

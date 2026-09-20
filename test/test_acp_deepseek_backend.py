@@ -25,6 +25,7 @@ from kiro_crew.acp.client import AcpClient
 from kiro_crew.acp.session_handle import models_from_config_options
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CUSTOM,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
@@ -268,11 +269,15 @@ def test_deepseek_is_the_only_unverified_known_backend() -> None:
     noticed rather than discovered when an edition's registration begins failing.
     """
     unverified = {b for b in ACP_BACKENDS_KNOWN if routing_for(b) is Routing.UNVERIFIED}
-    assert unverified == {ACP_BACKEND_DEEPSEEK}
-    # Every known id is named EXPLICITLY, so none of the others is unverified merely
-    # by omission.
+    # custom is UNVERIFIED while no ``agent.custom_acp`` is registered -- config load
+    # rewrites its row to ``SESSION_CONFIG`` -- and that is what keeps an
+    # unconfigured custom off the switch. Its row is explicit, like every other.
+    assert unverified == {ACP_BACKEND_DEEPSEEK, ACP_BACKEND_CUSTOM}
     from kiro_crew.acp_backends import ACP_BACKEND_ROUTING
 
+    # Every known id has a routing row of its own; nothing is left to the table's
+    # fail-closed default, so a dropped row fails HERE rather than reading as
+    # UNVERIFIED by accident.
     assert set(ACP_BACKEND_ROUTING) >= ACP_BACKENDS_KNOWN
     # And no unverified id is in the shipped baseline, which is what makes the
     # refusal a no-op for every harness carried today.

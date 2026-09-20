@@ -44,11 +44,14 @@ def _isolate(tmp_path, monkeypatch):
     # is how two views of one registry start disagreeing.
     baseline = set(acp_backends._baseline)
     selectable = set(acp_backends._selectable)
+    denied = set(acp_backends._denied)
     yield
     acp_backends._baseline.clear()
     acp_backends._baseline.update(baseline)
     acp_backends._selectable.clear()
     acp_backends._selectable.update(selectable)
+    acp_backends._denied.clear()
+    acp_backends._denied.update(denied)
     gp.reset_store()
     ctx_mod.reset_context()
 

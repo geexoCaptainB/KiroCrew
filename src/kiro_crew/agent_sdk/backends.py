@@ -163,6 +163,12 @@ with no row here.
    * - ``ACP_BACKENDS_RESUME_WITHOUT_LOAD``
      - driver-internal (which ACP verb restores a session, and which capability
        key advertises it)
+   * - ``ACP_BACKENDS_OPERATOR_CONFIGURED``
+     - pre-session registry query (whether a harness's launch and gate arrive from
+       ``config.json`` rather than from this build, so a card asked "is this id
+       offered by the build" answers yes for it even while nothing is registered:
+       the thing standing between the reader and a session is a config block they
+       can write, which its install row names, not a build they cannot change)
    * - ``ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY``
      - driver-internal (whether the session's project checkout scopes the broker
        overlay lookup, read only through :func:`overlay_project_scope` while
@@ -180,6 +186,7 @@ seam). Both already existed; neither gained a member here.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, FrozenSet, Mapping, Set
@@ -247,6 +254,23 @@ ACP_BACKEND_GOOSE = "goose"
 # closure -- so one global install is the whole precondition, with no workspace
 # checkout and no per-profile dependency step.
 ACP_BACKEND_DEEPSEEK = "deepseek"
+# Custom: an ACP harness the OPERATOR names rather than one this core ships. The
+# operator supplies the command that serves ACP over stdio, its arguments, and the
+# ``configOptions`` id/value that makes the harness ask before it acts; Crew
+# supplies nothing about the harness itself. The id is KNOWN at import so a
+# governance rule can deny it and every capability set can record a decision for
+# it, but it has NO launch, NO routing and NO selectability until
+# :func:`register_custom_backend` is handed a complete spec at config load -- so an
+# unconfigured build spells the id and offers nothing under it.
+#
+# What this id is FOR: trying a harness this core has not onboarded, without a
+# fork. What it is NOT: a way to run an ungated harness. The spec must name a
+# permission gate, that gate is applied through the same ``Routing.SESSION_CONFIG``
+# path codex uses, and a harness that does not advertise it is refused before its
+# first prompt with the reason named. Everything a capability set decides for this
+# id is decided as "unknown, so not claimed": the operator's harness may well do
+# more, and a harness that does is onboarded as a NAMED backend, with evidence.
+ACP_BACKEND_CUSTOM = "custom"
 # The kiro-cli backend is spelled as the empty string throughout, so name it
 # rather than leaving every call site to infer it from "not claude".
 ACP_BACKEND_KIRO = ""
@@ -264,6 +288,7 @@ ACP_BACKENDS_KNOWN: FrozenSet[str] = frozenset(
         ACP_BACKEND_PI,
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
+        ACP_BACKEND_CUSTOM,
     }
 )
 
@@ -358,6 +383,8 @@ ACP_BACKENDS_KNOWN: FrozenSet[str] = frozenset(
 # The channel TABLE lives in ``kiro_crew.acp._dispatch`` (it holds wire field names, which
 # are driver detail); this set is the vocabulary half, and a test asserts the two agree so
 # a row and its membership cannot drift apart.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_META_IDENTITY: FrozenSet[str] = frozenset({ACP_BACKEND_GOOSE})
 
 #
@@ -377,6 +404,8 @@ ACP_BACKENDS_META_IDENTITY: FrozenSet[str] = frozenset({ACP_BACKEND_GOOSE})
 # ``mcp-stdio-rollback-live.jsonl`` for what an unstartable element actually does.
 # It reads no ``~/.kiro/agents/<name>.json``, so this array is the only channel Crew
 # has to it.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_SESSION_MCP_ARRAY: FrozenSet[str] = frozenset(
     {
         ACP_BACKEND_CLAUDE,
@@ -475,6 +504,13 @@ ACP_BACKENDS_SESSION_MCP_ARRAY: FrozenSet[str] = frozenset(
 #: run for almost nothing a session actually does. Offering the switch would be
 #: offering a harness Crew cannot gate; ``test_agent_backend_editable`` names it in
 #: ``NOT_SHIPPED_SELECTABLE`` with that reason.
+#: ``ACP_BACKEND_CUSTOM`` is NOT included either, and for a different reason: it
+#: fails the FIRST condition at import and passes both once configured. An
+#: unconfigured build has no command to probe and no gate to enforce, so the
+#: baseline cannot carry it. :func:`register_custom_backend` writes its launch row,
+#: its routing and its selectability together at config load, so the id is
+#: selectable exactly when a complete spec is in ``agent.custom_acp`` and at no
+#: other time. Named in ``NOT_SHIPPED_SELECTABLE`` with that reason.
 BASELINE_SELECTABLE_BACKENDS: FrozenSet[str] = frozenset(
     {
         ACP_BACKEND_KIRO,
@@ -486,6 +522,18 @@ BASELINE_SELECTABLE_BACKENDS: FrozenSet[str] = frozenset(
         ACP_BACKEND_GOOSE,
     }
 )
+
+#: Harnesses whose launch facts and permission gate arrive from ``config.json``
+#: rather than from this build.
+#:
+#: One member, and the set exists so the card projection can ask the question
+#: without naming an id: an operator-configured harness is OFFERED by the build --
+#: behind a config block rather than an install -- whatever the selectable registry
+#: holds at the moment of asking. Read as a build exclusion, its row would tell the
+#: reader there is nothing to do, when the row's own install verdict names exactly
+#: what to do. Nothing else keys on this set: selectability still runs through the
+#: one gate, and the registry it reads is written only by :func:`register_custom_backend`.
+ACP_BACKENDS_OPERATOR_CONFIGURED: FrozenSet[str] = frozenset({ACP_BACKEND_CUSTOM})
 
 # ── Policy-facing spelling ──
 # A governance rule is written by a human into ``security_policy.json`` and is
@@ -509,6 +557,10 @@ POLICY_ID_BY_BACKEND: dict = {
     ACP_BACKEND_PI: ACP_BACKEND_PI,
     ACP_BACKEND_GOOSE: ACP_BACKEND_GOOSE,
     ACP_BACKEND_DEEPSEEK: ACP_BACKEND_DEEPSEEK,
+    # Nameable BEFORE anything registers it, like every other id: a fleet policy that
+    # forbids operator-named harnesses denies ``custom`` whether or not this
+    # deployment ever configures one.
+    ACP_BACKEND_CUSTOM: ACP_BACKEND_CUSTOM,
 }
 
 #: The backend a deployment policy may never deny.
@@ -543,6 +595,14 @@ GOVERNANCE_FLOOR_BACKEND: str = ACP_BACKEND_KIRO
 # failure: it is idempotent, order-independent, and reversible.
 _baseline: Set[str] = set(BASELINE_SELECTABLE_BACKENDS)
 _selectable: Set[str] = set(BASELINE_SELECTABLE_BACKENDS)
+#: What the LAST policy pass denied, kept so a registration that arrives AFTER that
+#: pass cannot undo it. Before this set existed, ``register_selectable_backend``
+#: wrote the effective set unconditionally -- harmless while every registrar ran
+#: at bootstrap, before the first pass, but the custom harness re-registers on every
+#: ``KiroCrewConfig.load()``, and a load that followed a denial put the denied id
+#: back on the switch until the next ceiling swap. Recorded by
+#: :func:`apply_selectable_denials`, honoured by :func:`register_selectable_backend`.
+_denied: Set[str] = set()
 
 
 def register_selectable_backend(backend: str) -> None:
@@ -556,7 +616,13 @@ def register_selectable_backend(backend: str) -> None:
 
     Writes the BASELINE and the effective set together, so an edition that
     registers after a policy pass has already run is still visible to the next
-    recompute rather than being silently dropped by it.
+    recompute rather than being silently dropped by it -- EXCEPT that an id the
+    last pass denied goes into the baseline alone. The baseline is what the next
+    recompute reads, so the id is not lost; the effective set is what a session
+    start reads, so a denied id must not appear there between the registration
+    and that recompute. Without this, a registrar that runs after a denial (the
+    custom harness re-registers on every config load) would put the denied id
+    back on the switch.
 
     Idempotent, so a re-entrant bootstrap costs nothing. Rejects an id outside
     ``ACP_BACKENDS_KNOWN``: provider construction would raise on it later, and a
@@ -598,7 +664,8 @@ def register_selectable_backend(backend: str) -> None:
             "established routing in ACP_BACKEND_ROUTING before it can be selectable."
         )
     _baseline.add(backend)
-    _selectable.add(backend)
+    if backend not in _denied or backend == GOVERNANCE_FLOOR_BACKEND:
+        _selectable.add(backend)
 
 
 def selectable_backends() -> FrozenSet[str]:
@@ -644,6 +711,12 @@ def apply_selectable_denials(denied: Set[str]) -> FrozenSet[str]:
     if GOVERNANCE_FLOOR_BACKEND in _baseline:
         keep.add(GOVERNANCE_FLOOR_BACKEND)
     removed = frozenset(_baseline - keep)
+    # Remembered, not just applied: a registrar that runs after this pass reads it
+    # (``register_selectable_backend``), so the pass holds until the next one
+    # rather than until the next registration. ASSIGNED like the set it governs,
+    # so a loosened policy releases what an earlier pass recorded.
+    _denied.clear()
+    _denied.update(denied)
     _selectable.clear()
     _selectable.update(keep)
     return removed
@@ -778,6 +851,8 @@ def resolve_selected_backend(value: object) -> str:
 # demux Crew has -- see ``ACP_BACKENDS_ACP_RUNTIME`` -- so Crew opens one process per
 # session and there is no shared session to persist. A harness capability Crew cannot
 # reach is recorded here rather than claimed.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_SESSION_SHARING = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CODEX})
 
 # Backends that can load an enrolled member's full saved agent spec at spawn.
@@ -785,6 +860,8 @@ ACP_BACKENDS_SESSION_SHARING = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CODEX})
 # support for either does not establish full-spec loading. Only kiro-cli has
 # demonstrated it; the provider still requires a live dedicated runtime and a
 # confirmed active template before reporting that the saved spec is loaded.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_MEMBER_CAPABILITIES = frozenset({ACP_BACKEND_KIRO})
 
 # Backends that can mount a DIFFERENT MCP tool set on one session than the
@@ -828,6 +905,8 @@ ACP_BACKENDS_MEMBER_CAPABILITIES = frozenset({ACP_BACKEND_KIRO})
 # cannot be gated is never refused because nothing gates it. Mounting session control
 # into such a session would hand Crew's own control plane to a harness whose tool
 # calls Crew does not decide. A member session on it stays plain chat.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_MEMBER_DISPATCH = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS})
 
 # Backends implementing the ``_session/steer`` extension (mid-turn steer).
@@ -853,6 +932,8 @@ ACP_BACKENDS_MEMBER_DISPATCH = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS})
 # ``sessionCapabilities`` of list and delete, and no steering extension.
 # deepseek is not a member: it advertises close, list and resume only, and permits
 # one in-flight prompt per session, so a mid-turn steer has no verb to travel on.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 
 # Backends that can serve a MANUAL ``/compact`` (the user-typed slash command).
@@ -922,6 +1003,8 @@ ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 # consequence: KAS compacts on its own initiative AND says so on the wire, so
 # declining its ``/compact`` costs nothing, while deepseek says nothing at all, so a
 # decline leaves its context unbounded.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_COMPACT = frozenset(
     {
         ACP_BACKEND_KIRO,
@@ -979,6 +1062,8 @@ ACP_BACKENDS_COMPACT = frozenset(
 # memberships it lacks, and the refusal arm that promises nothing -- so the leak is
 # reported rather than either denied or answered by ending the conversation. pi and
 # goose are that case today.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_HARNESS_MANAGED_COMPACTION = frozenset({ACP_BACKEND_KAS})
 
 # Backends whose FULL context is answered by recycling the session, because no
@@ -1008,6 +1093,8 @@ ACP_BACKENDS_HARNESS_MANAGED_COMPACTION = frozenset({ACP_BACKEND_KAS})
 # in its own words (:func:`compact_unsupported_reply` has a third sentence for
 # exactly this case), and the gate logs a WARNING naming the gap, so the condition
 # is reported rather than silent while somebody decides which set it belongs in.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_CONTEXT_RECYCLE = frozenset({ACP_BACKEND_DEEPSEEK})
 
 # Backends that finish a manual ``/compact`` INSIDE the ``session/prompt`` turn,
@@ -1043,6 +1130,8 @@ ACP_BACKENDS_CONTEXT_RECYCLE = frozenset({ACP_BACKEND_DEEPSEEK})
 # pi and goose are absent for the reason recorded on ``ACP_BACKENDS_COMPACT``: their
 # source says inline, no capture confirms it, and the two memberships move together
 # when one does.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_INLINE_COMPACTION = frozenset(
     {
         ACP_BACKEND_CLAUDE,
@@ -1084,6 +1173,8 @@ ACP_BACKENDS_INLINE_COMPACTION = frozenset(
 # tool executors from inside the same process -- it is not an OS sandbox that Crew's
 # seatbelt would nest inside, and it does not carry Crew's credential mask. Skipping
 # Crew's layer for it would drop the compensating control for its passive reads.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_INTERNAL_SANDBOX = frozenset({ACP_BACKEND_KIRO})
 
 # Backends whose pod-spawned child has its ambient ``HOME`` relocated onto the
@@ -1116,6 +1207,8 @@ ACP_BACKENDS_INTERNAL_SANDBOX = frozenset({ACP_BACKEND_KIRO})
 # deepseek is excluded on the same grounds: its whole home is ``DSH_HOME``, which its
 # auth declaration names, so the floor re-anchors the declared leaf under the
 # override and a ``$HOME`` relocation reaches nothing the override does not.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_POD_HOME_REMAP = frozenset({ACP_BACKEND_KIRO})
 
 # Backends served by AcpRuntime + AcpSessionHandle — the kiro-agent family
@@ -1159,6 +1252,8 @@ ACP_BACKENDS_POD_HOME_REMAP = frozenset({ACP_BACKEND_KIRO})
 # cli.json overlay and takes effort through ``session/set_config_option``. That
 # is why membership here is a statement about the TRANSPORT and nothing else --
 # every kiro-family convention is its own set, and codex is absent from each.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_ACP_RUNTIME = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CODEX})
 
 # Backends that load an agent defined as ONE markdown file (YAML frontmatter
@@ -1177,6 +1272,8 @@ ACP_BACKENDS_ACP_RUNTIME = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BAC
 # a member because Crew reads the spec itself and hands it over the wire, so the
 # on-disk form is Crew's to parse; codex-acp, opencode and pi are not members
 # because none of them reads ``~/.kiro/agents`` at all.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_MARKDOWN_AGENT_SPECS = frozenset({ACP_BACKEND_KAS})
 
 # Backends whose agent spec comes from the USER-LEVEL directory alone, so a
@@ -1199,6 +1296,8 @@ ACP_BACKENDS_MARKDOWN_AGENT_SPECS = frozenset({ACP_BACKEND_KAS})
 # them outside the pool, outside caller-identity attribution and outside broker
 # governance. Read through the runtime's own scope helper, never as "is KAS": a
 # host added later that reads the user level alone joins here.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY = frozenset({ACP_BACKEND_KAS})
 
 
@@ -1281,6 +1380,8 @@ def overlay_project_scope(backend: str, work_dir: Any) -> dict[str, Any]:
 # membership rather than as "is kiro": a host added later that mounts a spec's
 # servers by its own channel joins here, and the detector says nothing wrong about
 # it on day one.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 
 # Backends whose teardown verb actually EVICTS the session from the adapter's own
@@ -1322,6 +1423,8 @@ ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KA
 # spelled as "not <some host>" would inherit an eviction guarantee it has never
 # demonstrated, and the operator who never opted into it is the one who finds the
 # adapter growing. Membership is earned by a measured teardown, not by default.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_SESSION_EVICTION = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CODEX})
 
 # ``ACP_BACKENDS_KIRO_IDENTITY_STORE`` is gone, and it has no replacement HERE.
@@ -1359,6 +1462,8 @@ ACP_BACKENDS_SESSION_EVICTION = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS, AC
 # ``[provider, model]`` pair -- ``["deepseek-official", "deepseek-v4-flash"]`` -- so
 # the value is passed through exactly as advertised rather than parsed. That is what
 # ``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION`` membership is for.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION = frozenset(
     {
         ACP_BACKEND_CLAUDE,
@@ -1390,6 +1495,8 @@ ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION = frozenset(
 # effort one offering off, low, high and max. It advertises that option under its own
 # id, ``reasoning_effort``, which ``EFFORT_CONFIG_OPTION_IDS`` below records --
 # membership says the channel exists, the table says what to call it.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION = frozenset(
     {ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_DEEPSEEK}
 )
@@ -1404,6 +1511,8 @@ ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION = frozenset(
 # refused. Opt-in (harness-parity H13): claude-agent-acp's ``[1m]`` suffix is a
 # context window and must reach the wire intact, and opencode's ``provider/model``
 # ids carry no suffix at all -- neither may inherit a split it never advertised.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS = frozenset({ACP_BACKEND_CODEX})
 
 # The ``configId`` each backend spells its reasoning-effort option with. One home
@@ -1481,6 +1590,8 @@ def effort_config_option_id(backend: str) -> str:
 # values are JSON-encoded ``[provider, model]`` pairs drawn from the harness's live
 # service catalog. Nothing can spell one of those from a stored bare model name, so
 # a pick that did not come from the capture is a pick the session refuses.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_ADVERTISED_MODEL_SELECTION = frozenset(
     {
         ACP_BACKEND_CLAUDE,
@@ -1512,6 +1623,8 @@ ACP_BACKENDS_ADVERTISED_MODEL_SELECTION = frozenset(
 # harness above: Crew writes no file for it at all. What it supplies to the child is
 # one pinned environment variable, and its model travels as a config option, so a
 # warm-pool claim that switches model leaves nothing anywhere to re-seed.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_SEED_LOCAL_SETTINGS = frozenset({ACP_BACKEND_CLAUDE})
 
 # Which model-registry NAMESPACE a backend's ids live in. This is a registry index
@@ -1557,6 +1670,12 @@ _MODEL_REGISTRY_NAMESPACE_BY_BACKEND: dict = {
     # other harness spells, so a shared bucket would offer the picker ids that only
     # one backend can accept.
     ACP_BACKEND_DEEPSEEK: "deepseek",
+    # custom gets its own key because its vocabulary is whatever the operator's
+    # harness speaks, which is by definition not the kiro family's. Nothing writes
+    # into this bucket today -- custom is outside the advertised-model capture -- so
+    # the key exists to keep a future capture out of the ``acp`` bucket rather than
+    # to hold anything now.
+    ACP_BACKEND_CUSTOM: "custom",
 }
 
 
@@ -1581,6 +1700,8 @@ def model_registry_namespace(backend: str) -> str:
 # way and has no ``_kiro.dev`` verb.
 # deepseek is not a member and publishes no command list either: it carries commands
 # internally and its ACP surface rejects them, so it exposes none over the wire.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_KIRO_SLASH_COMMANDS = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 
 # Backends that read the MCP Tool Search setting from the workspace ``cli.json``
@@ -1589,6 +1710,8 @@ ACP_BACKENDS_KIRO_SLASH_COMMANDS = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS}
 # nothing forwards it, so a Tool Search value written there for a KAS session is
 # dead -- the setting looks on in the dashboard while the engine runs with it off.
 # KAS takes the setting from the handshake instead (the set below).
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_TOOL_SEARCH_OVERLAY = frozenset({ACP_BACKEND_KIRO})
 
 # Backends that take feature settings from the ACP ``initialize`` request, under
@@ -1598,6 +1721,8 @@ ACP_BACKENDS_TOOL_SEARCH_OVERLAY = frozenset({ACP_BACKEND_KIRO})
 # the spawn agent's spec granting the ``tool_search`` loader, because KAS defers
 # every MCP spec when told to and does not check that a loader exists. kiro-cli
 # is not a member: it has no such channel and reads the overlay file instead.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_CLIENT_META_SETTINGS = frozenset({ACP_BACKEND_KAS})
 
 # Backends that reconcile an edited agent config into their RUNNING sessions: a
@@ -1622,6 +1747,8 @@ ACP_BACKENDS_CLIENT_META_SETTINGS = frozenset({ACP_BACKEND_KAS})
 # pi is not a member: same reason, and its session has no Crew MCP set at all.
 # deepseek is not a member: its MCP servers arrive as a ``session/new`` array, so its
 # running set is described by the request that made the session and by no file.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD = frozenset({ACP_BACKEND_KIRO})
 
 # Backends on which a Side Chat turn may EXECUTE read-only tools under
@@ -1653,6 +1780,8 @@ ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD = frozenset({ACP_BACKEND_KIRO})
 # see: that posture is enforced by the harness's own sandbox, which denies rather
 # than asks, so no call reaches the host gate and no SEL row is written. A side turn
 # on it runs ``REJECT_ALL``.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_SIDE_READONLY = frozenset({ACP_BACKEND_KIRO})
 
 # Backends whose model-side REFUSAL arrives with a structured reason, not just a
@@ -1679,6 +1808,8 @@ ACP_BACKENDS_SIDE_READONLY = frozenset({ACP_BACKEND_KIRO})
 # deepseek is not a member: it maps a turn ending onto a plain ACP ``stopReason`` and
 # keeps provider-specific detail off the wire, so its refusal card has no category
 # line either.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_STRUCTURED_REFUSAL = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 
 # Backends whose child may ask THIS host for an access token over the
@@ -1705,6 +1836,8 @@ ACP_BACKENDS_STRUCTURED_REFUSAL = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 # ``initialize`` result advertises ``authMethods: []`` and its ``authenticate``
 # returns immediate success, so the ACP layer authenticates nothing at all and the
 # provider key it needs is resolved inside the harness from its own credential store.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_HOST_AUTH_CALLBACK = frozenset({ACP_BACKEND_KAS})
 
 # Backends that keep their OWN session records and resolve a resume from the
@@ -1721,6 +1854,8 @@ ACP_BACKENDS_HOST_AUTH_CALLBACK = frozenset({ACP_BACKEND_KAS})
 # from the id alone through its own session map, replaying the conversation as
 # ``user_message_chunk`` / ``agent_message_chunk`` updates before answering
 # (``test/fixtures/acp_frames/pi/session-load-live.jsonl``).
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_HARNESS_OWNED_SESSIONS = frozenset(
     {
         ACP_BACKEND_CLAUDE,
@@ -1751,6 +1886,8 @@ ACP_BACKENDS_HARNESS_OWNED_SESSIONS = frozenset(
 # rejects modes across its whole surface, so it can never return one. Membership is
 # what keeps a restored conversation from being discarded by a check for a block this
 # harness has nothing to put in.
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_LOAD_WITHOUT_MODES = frozenset({ACP_BACKEND_OPENCODE, ACP_BACKEND_DEEPSEEK})
 
 # Backends that restore a session with ``session/resume`` instead of
@@ -1787,6 +1924,8 @@ ACP_BACKENDS_LOAD_WITHOUT_MODES = frozenset({ACP_BACKEND_OPENCODE, ACP_BACKEND_D
 # on the day, with no record of what Crew verified and no place to write down why. The
 # set is the record, and adding a harness to it is a deliberate edit with a capture
 # behind it (harness-parity H6, the same reason every capability here is opt-in).
+# custom is not a member. Nothing is known about an operator-named harness, so
+# nothing is claimed for it -- the rule ``ACP_BACKEND_CUSTOM`` states in full.
 ACP_BACKENDS_RESUME_WITHOUT_LOAD = frozenset({ACP_BACKEND_DEEPSEEK})
 
 
@@ -1898,6 +2037,15 @@ ACP_BACKEND_ROUTING: dict = {
     # setting that governs escalations and assert a routing guarantee nothing
     # performs, which is the one thing this table exists to prevent.
     ACP_BACKEND_DEEPSEEK: Routing.UNVERIFIED,
+    # custom is ``UNVERIFIED`` while no ``agent.custom_acp`` is registered: nothing
+    # is known about a harness nobody has named, and ``UNVERIFIED`` is what keeps it
+    # off the switch. The row is EXPLICIT rather than left to the fail-closed
+    # ``.get`` default so the census over this table
+    # (``test_deepseek_is_the_only_unverified_known_backend``) covers every known id
+    # with no exemption. :func:`register_custom_backend` rewrites the row to
+    # ``SESSION_CONFIG`` together with the permission pair the spec supplies and the
+    # launch record, and :func:`unregister_custom_backend` puts ``UNVERIFIED`` back.
+    ACP_BACKEND_CUSTOM: Routing.UNVERIFIED,
 }
 
 
@@ -1962,7 +2110,8 @@ class SelfServedLaunch:
     """The launch facts of one harness that serves ACP from its own binary.
 
     ``binary`` is the name searched for on PATH, ``acp_args`` is what follows it on
-    the argv, ``bin_env_var`` is the operator override read before the search,
+    the argv, ``bin_env_var`` is the operator override read before the search (empty
+    when the harness has none, as the operator-named custom harness does not),
     ``install_command`` is what an absent verdict tells the operator to run, ``label``
     is the harness's display name, and ``protocol_version`` is the handshake dialect.
 
@@ -1983,10 +2132,22 @@ class SelfServedLaunch:
     install_command: str
     protocol_version: int
     missing_hint: str
+    #: True when the args are the OPERATOR'S rather than the build's. A shipped
+    #: harness's args are fixed strings this module spells; an operator's may carry
+    #: a key or a token, so a label that will be logged must not repeat them.
+    args_are_operator_supplied: bool = False
 
     @property
     def spawn_label(self) -> str:
-        """What the spawn is logged under: the binary name and its own args."""
+        """What the spawn is logged under: the binary name and its own args.
+
+        For a launch whose args the operator supplied, the binary's basename and the
+        arg COUNT instead -- the log this label lands in outlives the session, and
+        ``--api-key <token>`` is an ordinary thing to find on such a command line.
+        """
+        if self.args_are_operator_supplied:
+            n = len(self.acp_args)
+            return f"{os.path.basename(self.binary)} [{n} operator-supplied arg{'s' if n != 1 else ''}]"
         return " ".join((self.binary, *self.acp_args)).strip()
 
 
@@ -2012,7 +2173,7 @@ class SelfServedLaunch:
 #: arms reads this table. What a member's arm still owns for itself is its ROUTING:
 #: opencode's config read-back, goose's mode seed and deepseek's absence of either
 #: are not launch facts and are not here.
-ACP_BACKEND_LAUNCH: Mapping[str, SelfServedLaunch] = {
+ACP_BACKEND_LAUNCH: dict[str, SelfServedLaunch] = {
     ACP_BACKEND_OPENCODE: SelfServedLaunch(
         label="OpenCode",
         binary="opencode",
@@ -2054,6 +2215,16 @@ ACP_BACKEND_LAUNCH: Mapping[str, SelfServedLaunch] = {
 #: harness's argv a value the table already holds?", which only the spawn path, the
 #: install probe and the driver seams ask. Derived from the table's keys rather than
 #: written a second time, so the two cannot disagree.
+#:
+#: Derived at IMPORT, so it names the harnesses whose launch is fixed by this build.
+#: ``ACP_BACKEND_CUSTOM`` is not among them: its row is written into
+#: :data:`ACP_BACKEND_LAUNCH` at config load and removed when the spec goes, so a
+#: caller that needs the live answer asks ``backend in ACP_BACKEND_LAUNCH`` (or
+#: :func:`launch_for`), which is what the spawn path already does. The sites that
+#: read this set are per-build enumerations -- the install-probe table and the
+#: parity tests -- and custom keeps a row of its own in each (``_probe_custom``),
+#: because an unconfigured custom has a verdict to give ("not configured") that no
+#: launch record could carry.
 ACP_BACKENDS_SELF_SERVED_ACP: FrozenSet[str] = frozenset(ACP_BACKEND_LAUNCH)
 
 #: The argv0 basename each harness's child process runs as.
@@ -2169,3 +2340,230 @@ def permission_setting_for(backend: str) -> tuple:
 def gate_probe_command_for(backend: str) -> str:
     """The probe command *backend*'s gate extension registers, or ``""`` when none."""
     return ACP_BACKEND_GATE_PROBE_COMMAND.get(backend, "")
+
+
+# ── The operator-named harness ──
+#
+# Everything above describes harnesses this build ships. ``ACP_BACKEND_CUSTOM`` is
+# the one id whose facts arrive from ``config.json`` instead, and this section is
+# the ONLY writer of those facts into the tables above. It exists so that "point
+# Crew at a harness it has never heard of" is a config edit rather than a fork, and
+# it is shaped so that the edit cannot produce an ungated harness on the switch:
+# the launch, the routing and the selectability are written by ONE function, from
+# ONE validated record, and removed by one function -- so there is no state in which
+# the id is selectable and its routing row is missing, whatever order the caller
+# thought of things in.
+
+#: What the operator's harness is called wherever a label is shown.
+CUSTOM_ACP_LABEL = "Custom ACP"
+
+#: The ACP protocol version the handshake asks for. ACP v1 is what
+#: ``configOptions`` -- the gate this harness is required to advertise -- is defined
+#: in, so a harness that can be gated at all speaks this dialect.
+CUSTOM_ACP_PROTOCOL_VERSION = 1
+
+
+@dataclass(frozen=True)
+class CustomAcpSpec:
+    """One operator-named ACP harness, as ``agent.custom_acp`` describes it.
+
+    ``command`` is the executable that serves ACP over stdio -- a name on PATH or
+    an absolute path -- and ``args`` is what follows it. ``gate_option`` and
+    ``gate_value`` name the ``session/new`` ``configOptions`` entry, and the value
+    of it, that makes the harness ask before it runs a tool; Crew applies that pair
+    through ``session/set_config_option`` before the first prompt and refuses the
+    session when the harness does not advertise it. All four are required: a spec
+    missing any of them describes nothing Crew can run safely, and
+    :func:`register_custom_backend` rejects it rather than filling a gap in.
+
+    Frozen for the same reason :class:`SelfServedLaunch` is: it becomes module
+    state every spawn reads.
+    """
+
+    command: str
+    args: tuple
+    gate_option: str
+    gate_value: str
+
+    def problems(self) -> list:
+        """Why this spec cannot be registered, as operator-readable sentences.
+
+        Empty means the spec is complete. Checked as a list rather than a first
+        failure so a form can show every gap at once.
+        """
+        found: list = []
+        if not self.command.strip():
+            found.append("command is empty: name the executable that serves ACP over stdio")
+        non_strings = [arg for arg in self.args if not isinstance(arg, str)]
+        if non_strings:
+            found.append(
+                "args must all be strings; quote "
+                + ", ".join(repr(arg) for arg in non_strings)
+                + " in config.json"
+            )
+        if not self.gate_option.strip():
+            found.append(
+                "gate_option is empty: name the session/new configOptions id whose "
+                "value makes the harness ask before it acts"
+            )
+        if not self.gate_value.strip():
+            found.append("gate_value is empty: name the value of that option which makes it ask")
+        return found
+
+    def launch(self) -> SelfServedLaunch:
+        """This spec as the launch record the shared self-served spawn path reads."""
+        return SelfServedLaunch(
+            label=CUSTOM_ACP_LABEL,
+            binary=self.command.strip(),
+            acp_args=tuple(self.args),
+            # No override variable: ``command`` already accepts an absolute path, so
+            # a variable naming the binary a second way would only add a place for
+            # the two to disagree. The ladder skips the override read when this is
+            # empty.
+            bin_env_var="",
+            # There is no command Crew can suggest for a harness it did not choose,
+            # so the remedy names where the command came from instead.
+            install_command=(
+                f"install whatever provides '{self.command.strip()}', or correct "
+                "agent.custom_acp.command in config.json"
+            ),
+            protocol_version=CUSTOM_ACP_PROTOCOL_VERSION,
+            missing_hint=(
+                "This harness is the one named in agent.custom_acp; Kiro Crew ships "
+                "nothing for it and knows no installer."
+            ),
+            args_are_operator_supplied=True,
+        )
+
+
+def coerce_custom_acp_spec(raw: object) -> "CustomAcpSpec | None":
+    """The spec a raw ``agent.custom_acp`` value describes, or ``None`` for none at all.
+
+    Tolerant of the shapes a hand-edited file can hold -- a non-dict, a missing
+    key, an args string instead of a list -- and strict about nothing here: an
+    INCOMPLETE spec is returned as one, so the caller can register it, be refused,
+    and log the refusal with the operator's own values in it. Only "there is no
+    spec" collapses to ``None``, which is what an absent or empty block means.
+    """
+    if not isinstance(raw, dict) or not raw:
+        return None
+    command = raw.get("command")
+    args_raw = raw.get("args")
+    if isinstance(args_raw, str):
+        args: tuple = (args_raw,) if args_raw else ()
+    elif isinstance(args_raw, (list, tuple)):
+        # Kept AS WRITTEN, non-strings included: ``problems()`` names them and the
+        # registration is refused. Dropping ``8080`` out of ``["--port", 8080]`` or
+        # coining ``"8080"`` for it would both spawn an argv the operator did not
+        # write, and a refusal that quotes the rule is the honest answer to a
+        # hand-edited file.
+        args = tuple(args_raw)
+    else:
+        args = ()
+    gate_option = raw.get("gate_option")
+    gate_value = raw.get("gate_value")
+    return CustomAcpSpec(
+        command=command if isinstance(command, str) else "",
+        args=args,
+        gate_option=gate_option if isinstance(gate_option, str) else "",
+        gate_value=gate_value if isinstance(gate_value, str) else "",
+    )
+
+
+_custom_spec: "CustomAcpSpec | None" = None
+
+
+def custom_backend_spec() -> "CustomAcpSpec | None":
+    """The spec currently registered under ``ACP_BACKEND_CUSTOM``, or ``None``."""
+    return _custom_spec
+
+
+def unregister_custom_backend() -> None:
+    """Remove the operator-named harness from every table it was written into.
+
+    The inverse of :func:`register_custom_backend`, and idempotent: a build that
+    never configured one loses nothing here. Removes the launch row and the
+    permission pair, puts the routing row back to ``UNVERIFIED`` (the row always
+    exists, so the routing census covers this id), and takes the id out of BOTH
+    selectable sets -- the baseline as well as the effective set, because a later
+    policy recompute rebuilds the effective set from the baseline, and an id left
+    in the baseline would come back on that recompute with nothing runnable behind
+    it.
+    """
+    global _custom_spec  # noqa: PLW0603
+    ACP_BACKEND_LAUNCH.pop(ACP_BACKEND_CUSTOM, None)
+    ACP_BACKEND_ROUTING[ACP_BACKEND_CUSTOM] = Routing.UNVERIFIED
+    ACP_BACKEND_PERMISSION_CONFIG.pop(ACP_BACKEND_CUSTOM, None)
+    _baseline.discard(ACP_BACKEND_CUSTOM)
+    _selectable.discard(ACP_BACKEND_CUSTOM)
+    _custom_spec = None
+
+
+def register_custom_backend(spec: "CustomAcpSpec | None") -> None:
+    """Make the operator-named harness in *spec* selectable, or make sure it is not.
+
+    The ONE writer of custom's rows. Called from the config load path with whatever
+    ``agent.custom_acp`` resolved to, BEFORE ``agent.acp_backend`` is normalized --
+    that ordering is what lets a persisted ``"custom"`` survive the load, since
+    :func:`resolve_selected_backend` reads the selectable set this call writes.
+
+    Three tables and one registry move together, in this order and for this reason:
+
+    1. the launch record, so the shared self-served spawn arm can resolve the
+       command;
+    2. the permission pair the spec names, so ``session_config_issue`` has an option
+       to look for on ``session/new`` and ``_apply_session_permission_routing`` has a
+       value to write;
+    3. the routing row, always :attr:`Routing.SESSION_CONFIG` -- the mechanism that
+       needs no harness-specific code because ACP v1 defines it, and the one this
+       core ENFORCES (``tool_gate.ENFORCED_ROUTINGS``), so a harness that does not
+       advertise the named option is refused before its first prompt and a harness
+       that does gets the OS credential mask for the reads ACP cannot gate;
+    4. :func:`register_selectable_backend`, which re-checks the routing row it now
+       finds and admits the id.
+
+    A ``None`` or incomplete spec UNREGISTERS instead: the previous rows go, so a
+    config edit that blanks the command also takes the harness off the switch on
+    the next load. The incomplete case raises ``ValueError`` naming every gap, after
+    unregistering -- the caller logs it, and the id reads as an unselectable value
+    the way any unusable ``acp_backend`` does. Nothing here validates that the
+    command EXISTS: that is the install probe's question, answered on the dashboard
+    row, so a harness that is configured but not yet installed still shows the
+    operator what is missing.
+    """
+    global _custom_spec  # noqa: PLW0603
+    if spec is None:
+        unregister_custom_backend()
+        return
+    problems = spec.problems()
+    if problems:
+        unregister_custom_backend()
+        raise ValueError("agent.custom_acp is incomplete: " + "; ".join(problems))
+    # Keyed on the BASELINE, not the effective set: a spec already registered whose
+    # id the live policy has since denied is still registered, and re-running the
+    # writes below would be how that denial got undone.
+    if spec == _custom_spec and ACP_BACKEND_CUSTOM in _baseline:
+        return
+    # Rewrite, never merge: a spec that changed its command must not keep the
+    # previous command's row for the instant between the two writes.
+    unregister_custom_backend()
+    ACP_BACKEND_LAUNCH[ACP_BACKEND_CUSTOM] = spec.launch()
+    ACP_BACKEND_PERMISSION_CONFIG[ACP_BACKEND_CUSTOM] = (
+        spec.gate_option.strip(),
+        spec.gate_value.strip(),
+    )
+    ACP_BACKEND_ROUTING[ACP_BACKEND_CUSTOM] = Routing.SESSION_CONFIG
+    try:
+        register_selectable_backend(ACP_BACKEND_CUSTOM)
+    except ValueError:
+        unregister_custom_backend()
+        raise
+    _custom_spec = spec
+    # The executable's basename and nothing else: the args are the operator's own
+    # and may carry a key or a token, and the gate pair is theirs to read on the
+    # dashboard row, not something to persist in a log that outlives the session.
+    logger.info(
+        "Custom ACP harness registered: %s (%s)",
+        CUSTOM_ACP_LABEL,
+        spec.launch().spawn_label,
+    )

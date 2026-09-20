@@ -32,6 +32,7 @@ from enum import Enum
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_CUSTOM,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
@@ -362,6 +363,27 @@ PROJECTIONS: dict[str, McpProjection] = {
             "the WHOLE session rather than being dropped"
         ),
         tracking="docs/request-for-change/rfc-agent-config-mirror.md#5-migration",
+    ),
+    ACP_BACKEND_CUSTOM: McpProjection(
+        kind=ProjectionKind.NO_CHANNEL,
+        reason=(
+            "custom is whatever command the operator named in agent.custom_acp, and "
+            "nothing has been measured about how -- or whether -- that harness mounts "
+            "an MCP server it is handed. Two sessions of two different harnesses can "
+            "both run under this id, so no capture could stand for the class. The "
+            "shared mirror-less append still puts the pooled broker stubs on its "
+            "session/new array, because that path is not keyed on identity, and the "
+            "harness may mount them, ignore them or refuse the session; Crew CLAIMS "
+            "none of the three. Declared no-channel so the card says a custom session "
+            "may hold none of Crew's tools, which is the one statement that is true "
+            "of every harness this id can name"
+        ),
+        channel=(
+            "the session/new mcpServers array, measured against the specific harness: "
+            "a stdio element that round-trips (initialize, tools/list, tools/call) is "
+            "what would move a harness from this id to a named one with a projection"
+        ),
+        tracking="docs/system-specs/modules/harness-onboarding.md#worked-example-the-custom-acp-harness",
     ),
 }
 

@@ -24,7 +24,7 @@ from kiro_crew import model_registry
 # The one gate stays inside ``_normalize_acp_backend`` on the way out of
 # config.json. Only what it reads changed: the registry, instead of a frozen
 # literal.
-from kiro_crew.acp_backends import resolve_selected_backend
+from kiro_crew.acp_backends import coerce_custom_acp_spec, resolve_selected_backend
 from kiro_crew.appearance_packs import safe_pack_id as _safe_pack_id
 from kiro_crew.computer_use.types import DEFAULT_ATTACH_SCREENSHOT as _CU_DEFAULT_ATTACH_SCREENSHOT
 from kiro_crew.computer_use.types import DEFAULT_MAX_TREE_DEPTH as _CU_DEFAULT_MAX_TREE_DEPTH
@@ -170,6 +170,28 @@ def coerce_role_models(raw: object) -> dict[str, str]:
         if val:
             out[role] = val
     return out
+
+
+def coerce_custom_acp(raw: object) -> dict[str, object]:
+    """Normalize the ``agent.custom_acp`` block from hand-edited config / request bodies.
+
+    The stored shape is exactly four keys -- ``command``, ``args`` (a list of
+    strings), ``gate_option``, ``gate_value`` -- or the empty dict for "no custom
+    harness". Unknown keys are dropped and a missing one is stored as its empty
+    value, so a reader sees one shape. Whether the block is COMPLETE is not decided
+    here: the leaf's ``register_custom_backend`` decides that at load, and it logs
+    the gaps with the operator's own values, which is why an incomplete block is
+    kept rather than collapsed to ``{}``.
+    """
+    spec = coerce_custom_acp_spec(raw)
+    if spec is None:
+        return {}
+    return {
+        "command": spec.command,
+        "args": list(spec.args),
+        "gate_option": spec.gate_option,
+        "gate_value": spec.gate_value,
+    }
 
 
 def coerce_role_efforts(raw: object) -> dict[str, str]:
@@ -976,6 +998,74 @@ class AgentConfig:
             # frozen literal.
         ),
     )
+    custom_acp: dict = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Custom ACP harness",
+            "An ACP harness of your own, selectable as acp_backend 'custom' once "
+            "complete. Kiro Crew applies the named gate option before the first "
+            "prompt and refuses the session if the harness does not advertise it. "
+            "That the option makes the harness ASK before it acts is your assurance, "
+            "not something Kiro Crew can verify up front; a session whose harness "
+            "completes a tool call without asking (or after Kiro Crew denied it) is "
+            "stopped with that option named. A call the harness itself labels as a "
+            "read, search or thought, or never reports at all, is invisible to that "
+            "check; only the sandbox mask limits it. Arguments are passed as typed "
+            "and appear in the process list, so keep secrets out of them. "
+            "An empty or incomplete block leaves 'custom' unselectable. Nothing else "
+            "is assumed about the harness: it gets none of Kiro Crew's own MCP tools "
+            "unless it happens to mount the pooled stdio servers, and its child "
+            "cannot read the credential directories Kiro Crew masks.",
+            # Declared so the schema describes the block's real shape (``args`` is
+            # an array, which a bare dict field would otherwise flag on every load)
+            # and so each key flattens into a ConfigEntry the CLI accepts. The
+            # field stays a plain dict for the same reason ``dashboard.terminal``
+            # does: an undeclared key round-trips rather than being stripped.
+            properties={
+                "command": {
+                    "type": "string",
+                    "default": "",
+                    "x-meta": {
+                        "label": "Command",
+                        "help": (
+                            "The executable that serves ACP over stdio: a name on PATH "
+                            "or an absolute path."
+                        ),
+                    },
+                },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "default": [],
+                    "x-meta": {
+                        "label": "Arguments",
+                        "help": "Arguments that follow the command, one per entry.",
+                    },
+                },
+                "gate_option": {
+                    "type": "string",
+                    "default": "",
+                    "x-meta": {
+                        "label": "Permission gate option",
+                        "help": (
+                            "The session/new configOptions id whose value makes the "
+                            "harness ask before it runs a tool (e.g. 'mode')."
+                        ),
+                    },
+                },
+                "gate_value": {
+                    "type": "string",
+                    "default": "",
+                    "x-meta": {
+                        "label": "Permission gate value",
+                        "help": (
+                            "The value of that option which makes it ask (e.g. " "'read-only')."
+                        ),
+                    },
+                },
+            },
+        ),
+    )
     default_agent: str = field(
         default="",
         metadata=_meta("Default Agent", "Default agent name for new sessions."),
@@ -1734,6 +1824,7 @@ class AgentConfig:
         # feeds coerced input.
         self.role_models = coerce_role_models(self.role_models)
         self.role_efforts = coerce_role_efforts(self.role_efforts)
+        self.custom_acp = coerce_custom_acp(self.custom_acp)
         # Same defensive coercion for the throttle-fallback model: normalize to
         # ""/"auto"/acp id, so consumers can trust the stored shape.
         self.fallback_model = coerce_fallback_model(self.fallback_model)

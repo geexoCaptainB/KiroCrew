@@ -64,6 +64,7 @@ from typing import Dict, FrozenSet, Protocol, Tuple, runtime_checkable
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_CUSTOM,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
@@ -626,6 +627,44 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         # Excluded deliberately, and for this harness the reason is stronger than a
         # separate store: there is no host credential on the wire at all, so a
         # ``kiro-cli logout`` cannot bear on whether a running session still works.
+        host_logout_retires_children=False,
+        entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
+    ),
+    AgentAuthDeclaration(
+        backend=ACP_BACKEND_CUSTOM,
+        # Crew knows nothing about where an operator-named harness keeps its
+        # credential, so it declares NO leaves rather than guessing one. The
+        # consequence is stated rather than hidden: a token this harness stores
+        # somewhere the read-gate floor does not already cover is readable by the
+        # agent's file tools, exactly as any other file under the home is. The floor
+        # still fences everything it fences for every harness -- ``~/.aws``,
+        # ``~/.ssh``, every declared leaf of every other harness -- and the OS
+        # credential mask applied to this harness's child (its routing is enforced)
+        # denies the child those same locations. An operator who runs a harness
+        # whose token lives elsewhere and wants it fenced onboards the harness as a
+        # named backend, which is where a leaf is declared with evidence.
+        credential_leaves=(),
+        home_override_env_vars=(),
+        # Empty, and here it is a CONSTRAINT rather than a fact about the harness: a
+        # driver may only ask the mask to spare a leaf its own declaration put on the
+        # floor, and this declaration put none there. So the child of a custom
+        # harness reads NONE of the credential homes the mask hides. That is the
+        # safe direction for a harness Crew cannot vouch for, and it is also why a
+        # harness that authenticates from ``~/.aws`` or another masked home will
+        # fail to sign in under this id -- the remedy names that.
+        adapter_own_leaves=(),
+        sign_in_remedy=(
+            "The custom harness signs in on its own, in whatever way its documentation "
+            "describes; Kiro Crew checks nothing here. Its child cannot read the "
+            "credential directories Kiro Crew masks (~/.aws, ~/.ssh and the other "
+            "harnesses' token stores), so a harness that authenticates from one of "
+            "those needs its credential somewhere else, or an environment variable."
+        ),
+        signed_out_message=(
+            "The custom harness is not signed in. Sign in the way its own documentation "
+            "describes, then start a new chat."
+        ),
+        # A host logout says nothing about a harness that never read the host store.
         host_logout_retires_children=False,
         entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
     ),

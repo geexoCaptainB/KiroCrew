@@ -1894,3 +1894,327 @@ describe('AgentBackendTab new backend', () => {
     )
   })
 })
+
+/**
+ * The operator-named harness: the one row that carries a form.
+ *
+ * `configurable: true` is the server's classification; everything the panel does
+ * for it follows from that flag plus the ordinary selectability answer. Unconfigured
+ * means "listed, not offered, form shown"; configured means the form stays and the
+ * ordinary Use button joins it.
+ */
+describe('AgentBackendTab custom harness', () => {
+  const customRow = (over: Partial<Parameters<typeof probeRow>[1]> = {}) =>
+    probeRow('custom', {
+      selectable: false,
+      installed: 'missing',
+      missing_components: ['agent.custom_acp'],
+      install_command: 'set agent.custom_acp in config.json',
+      ...card({ tool_approval: 'unverified', offered_by_build: true }),
+      configurable: true,
+      ...over,
+    } as Parameters<typeof probeRow>[1])
+
+  it('lists an unconfigured custom harness instead of hiding it as a policy denial', async () => {
+    acpBackendsMock.mockResolvedValue({ backends: [probeRow('', card()), customRow()] })
+    wrap()
+    await waitFor(() => expect(row('Custom ACP')).toBeInTheDocument())
+    highlight('Custom ACP')
+    // The status points at the form, not at "missing on this machine".
+    await waitFor(() =>
+      expect(panel().getByText('Not set up yet. Fill in the form below.')).toBeInTheDocument(),
+    )
+    // No Use button: a PATCH the wire would refuse is not a button.
+    expect(screen.queryByRole('button', { name: /Use Custom ACP/ })).toBeNull()
+    // No copyable config-block "install command" either -- the form is the remedy.
+    expect(panel().queryByText('set agent.custom_acp in config.json')).toBeNull()
+    expect(screen.getByRole('form', { name: 'Custom ACP agent' })).toBeInTheDocument()
+    // One word for one state: the row says "Not set up", not "Missing" -- nothing is
+    // absent from the machine, the record is.
+    expect(row('Custom ACP').textContent).toContain('Not set up')
+    expect(row('Custom ACP').textContent).not.toContain('Missing')
+    // A re-check of an unwritten record can only re-answer "not set up yet".
+    expect(panel().queryByRole('button', { name: 'Check again' })).toBeNull()
+    // Nothing stored, nothing to remove.
+    expect(screen.queryByRole('button', { name: 'Remove agent' })).toBeNull()
+  })
+
+  it('removes a stored agent from an explicit button, and says so', async () => {
+    kirocrewConfigMock.mockResolvedValue({
+      agent: {
+        acp_backend: '',
+        custom_acp: { command: 'my-acp', args: ['serve'], gate_option: 'mode', gate_value: 'read-only' },
+      },
+    })
+    schemaMock.mockReturnValue(schemaWith(['', 'claude', 'kas', 'custom']))
+    acpBackendsMock.mockResolvedValue({
+      backends: [probeRow('', card()), customRow({ selectable: true, installed: 'installed', missing_components: [] })],
+    })
+    acpBackendRecheckMock.mockResolvedValue({ backend: customRow() })
+    wrap()
+    await waitFor(() => expect(row('Custom ACP')).toBeInTheDocument())
+    highlight('Custom ACP')
+    const form = within(await screen.findByRole('form', { name: 'Custom ACP agent' }))
+    // A configured row gets a sentence in the strip, not the bare "Experimental" word.
+    expect(screen.getByRole('tabpanel').textContent).toContain('The agent named in agent.custom_acp.')
+    // The form has a visible heading, so the row's "Use Custom ACP" button above it
+    // cannot be taken for the form's own Save.
+    expect(form.getByRole('heading', { name: 'Custom ACP agent' })).toBeInTheDocument()
+    // Removal names its object and is two clicks: the first asks, and "Keep it"
+    // answers no with nothing written.
+    const removeButton = form.getByRole('button', { name: 'Remove Custom ACP' })
+    removeButton.focus()
+    fireEvent.click(removeButton)
+    // The question names everything the write deletes -- the value too.
+    expect(
+      form.getByText(
+        'Remove Custom ACP? Its command, arguments, permission option and permission value are deleted.',
+      ),
+    ).toBeInTheDocument()
+    // Its two answers are a row of their own, above the Save row: no row holds
+    // three buttons, and the pressed Remove button is gone while the question is open.
+    const question = form.getByRole('group', { name: /^Remove Custom ACP\? / })
+    expect(within(question).getAllByRole('button').map(b => b.textContent)).toEqual([
+      'Keep it',
+      'Yes, remove it',
+    ])
+    expect(question).not.toContainElement(form.getByRole('button', { name: 'Save' }))
+    expect(form.queryByRole('button', { name: 'Remove Custom ACP' })).toBeNull()
+    // Focus follows: the pressed button unmounted, so it lands on the safe answer.
+    expect(form.getByRole('button', { name: 'Keep it' })).toHaveFocus()
+    fireEvent.click(form.getByRole('button', { name: 'Keep it' }))
+    expect(patchConfigMock).not.toHaveBeenCalled()
+    expect(form.queryByText(/^Remove Custom ACP\? /)).toBeNull()
+    // ...and back to Remove on cancel.
+    expect(form.getByRole('button', { name: 'Remove Custom ACP' })).toHaveFocus()
+    expect(form.getByLabelText(/^Command/)).toHaveValue('my-acp')
+    fireEvent.click(form.getByRole('button', { name: 'Remove Custom ACP' }))
+    fireEvent.click(form.getByRole('button', { name: 'Yes, remove it' }))
+    await waitFor(() =>
+      expect(patchConfigMock).toHaveBeenCalledWith('agent.custom_acp', {
+        command: '',
+        args: [],
+        gate_option: '',
+        gate_value: '',
+      }),
+    )
+    // The fields are emptied and the outcome line is "removed", not an install
+    // verdict -- and it does not claim the still-listed row has vanished.
+    expect(form.getByLabelText(/^Command/)).toHaveValue('')
+    await waitFor(() =>
+      expect(form.getByRole('status')).toHaveTextContent(
+        'Removed. Custom ACP is not selectable until set up again.',
+      ),
+    )
+    expect(form.queryByText(/not found on this machine/)).toBeNull()
+  })
+
+  it('shows placeholders as examples, not as values already entered', async () => {
+    kirocrewConfigMock.mockResolvedValue({ agent: { acp_backend: '' } })
+    schemaMock.mockReturnValue(schemaWith(['', 'claude', 'kas', 'custom']))
+    acpBackendsMock.mockResolvedValue({
+      backends: [probeRow('', card()), customRow({ selectable: false, installed: 'missing' })],
+    })
+    wrap()
+    await waitFor(() => expect(row('Custom ACP')).toBeInTheDocument())
+    highlight('Custom ACP')
+    const form = within(await screen.findByRole('form', { name: 'Custom ACP agent' }))
+    expect(form.getByLabelText(/^Command/)).toHaveAttribute('placeholder', 'e.g. my-acp-agent')
+    expect(form.getByLabelText(/^Permission option/)).toHaveAttribute('placeholder', 'e.g. mode')
+    expect(form.getByLabelText(/^Permission value/)).toHaveAttribute('placeholder', 'e.g. read-only')
+    // No stored command: nothing to remove, so no Remove control is offered.
+    expect(form.queryByRole('button', { name: 'Remove Custom ACP' })).toBeNull()
+  })
+
+  it('still hides an unselectable row the server does not mark configurable', async () => {
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow('', card()),
+        probeRow('goose', { selectable: false, ...card({ offered_by_build: true }) }),
+      ],
+    })
+    wrap()
+    await waitFor(() => expect(row('Kiro CLI')).toBeInTheDocument())
+    expect(screen.queryByRole('tab', { name: /goose/ })).toBeNull()
+  })
+
+  it('hides a CONFIGURED custom harness the policy denies, instead of calling it unconfigured', async () => {
+    // The record is stored, so "not set up yet" would be false; the only thing
+    // keeping the row unselectable is the deployment's policy, which is not the
+    // reader's to fix from this panel -- so the row goes the way every denied row does.
+    kirocrewConfigMock.mockResolvedValue({
+      agent: {
+        acp_backend: '',
+        custom_acp: { command: 'my-acp', args: ['serve'], gate_option: 'mode', gate_value: 'read-only' },
+      },
+    })
+    acpBackendsMock.mockResolvedValue({
+      backends: [probeRow('', card()), customRow({ installed: 'installed', missing_components: [] })],
+    })
+    wrap()
+    await waitFor(() => expect(row('Kiro CLI')).toBeInTheDocument())
+    // Config has loaded (the mock resolved) and the row is gone with it.
+    await waitFor(() => expect(screen.queryByRole('tab', { name: /Custom ACP/ })).toBeNull())
+    expect(screen.queryByText('Not set up yet. Fill in the form below.')).toBeNull()
+  })
+
+  it('saves the record whole, then refreshes and re-checks the row', async () => {
+    acpBackendsMock.mockResolvedValue({ backends: [probeRow('', card()), customRow()] })
+    acpBackendRecheckMock.mockResolvedValue({ backend: customRow({ selectable: true, installed: 'installed' }) })
+    wrap()
+    await waitFor(() => expect(row('Custom ACP')).toBeInTheDocument())
+    highlight('Custom ACP')
+    const form = within(await screen.findByRole('form', { name: 'Custom ACP agent' }))
+
+    // What saving asserts is stated where it is saved: the host verifies the option
+    // is offered and applied, and the operator vouches for what it means.
+    expect(form.getByTestId('custom-acp-attestation')).toHaveTextContent(
+      /cannot check what the option means.*operating-system sandbox it runs in/,
+    )
+    // The process-list warning sits beside the field it is about, not at the tail
+    // of the attestation paragraph: an operator pasting `--api-key <token>` reads
+    // it where they paste.
+    expect(form.getByTestId('custom-acp-attestation')).not.toHaveTextContent(/keep secrets out/)
+    expect(form.getByLabelText(/^Arguments/)).toHaveAccessibleDescription(
+      /One argument per line\. Arguments are passed as typed and appear in the process list, so keep secrets out of them\./,
+    )
+
+    // Nothing is sent while a required field is empty, and the reader is told WHICH:
+    // with the command typed, the warning names only the two still empty.
+    const save = form.getByRole('button', { name: 'Save' })
+    expect(save).toBeDisabled()
+    // An all-empty form is a clear, not an incomplete record: no warning.
+    expect(form.queryByRole('status')).toBeNull()
+    fireEvent.change(form.getByLabelText(/^Command/), { target: { value: ' my-acp ' } })
+    fireEvent.change(form.getByLabelText(/^Arguments/), { target: { value: 'serve\n\n --stdio ' } })
+    expect(save).toBeDisabled()
+    expect(form.getByRole('status')).toHaveTextContent(
+      'Still needed: Permission option and Permission value.',
+    )
+    expect(form.getByRole('status')).not.toHaveTextContent('Command,')
+    // Nothing is on disk here, so nothing can be removed: the warning says only
+    // what is still needed. Removal has its own button once a record exists.
+    expect(form.getByRole('status')).not.toHaveTextContent(/clear every field/)
+    fireEvent.change(form.getByLabelText(/^Permission option/), { target: { value: 'mode' } })
+    fireEvent.change(form.getByLabelText(/^Permission value/), { target: { value: 'read-only' } })
+    expect(save).toBeEnabled()
+    // All three present: no warning at all, not a leftover hint.
+    expect(form.queryByRole('status')).toBeNull()
+
+    fireEvent.click(save)
+    await waitFor(() =>
+      expect(patchConfigMock).toHaveBeenCalledWith('agent.custom_acp', {
+        command: 'my-acp',
+        args: ['serve', '--stdio'],
+        gate_option: 'mode',
+        gate_value: 'read-only',
+      }),
+    )
+    // The write is followed by a re-check of THIS row, so the verdict is measured.
+    await waitFor(() => expect(acpBackendRecheckMock).toHaveBeenCalledWith('custom'))
+    // And the status line CLOSES with what the re-check found, instead of sitting on
+    // "checking" beside a row that already reads Ready.
+    await waitFor(() =>
+      expect(form.getByRole('status')).toHaveTextContent('Saved. The command was found.'),
+    )
+    expect(form.queryByText(/Checking whether the command is installed/)).toBeNull()
+    // The switch never moved: the form writes the record, not `agent.acp_backend`.
+    expect(patchConfigMock).not.toHaveBeenCalledWith('agent.acp_backend', expect.anything())
+  })
+
+  it('closes the saved line with "not found" when the re-check does not find the command', async () => {
+    acpBackendsMock.mockResolvedValue({ backends: [probeRow('', card()), customRow()] })
+    acpBackendRecheckMock.mockResolvedValue({
+      backend: customRow({ selectable: true, installed: 'missing', missing_components: ['nope'] }),
+    })
+    wrap()
+    await waitFor(() => expect(row('Custom ACP')).toBeInTheDocument())
+    highlight('Custom ACP')
+    const form = within(await screen.findByRole('form', { name: 'Custom ACP agent' }))
+    fireEvent.change(form.getByLabelText(/^Command/), { target: { value: 'nope' } })
+    fireEvent.change(form.getByLabelText(/^Permission option/), { target: { value: 'mode' } })
+    fireEvent.change(form.getByLabelText(/^Permission value/), { target: { value: 'read-only' } })
+    fireEvent.click(form.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(acpBackendRecheckMock).toHaveBeenCalledWith('custom'))
+    await waitFor(() =>
+      expect(form.getByRole('status')).toHaveTextContent(
+        'Saved. The command was not found on this machine.',
+      ),
+    )
+    // Terminal until the next edit; an edit clears it.
+    fireEvent.change(form.getByLabelText(/^Command/), { target: { value: 'nope2' } })
+    expect(form.queryByText(/Saved\./)).toBeNull()
+  })
+
+  it('seeds the form from the stored record and offers the Use button once configured', async () => {
+    kirocrewConfigMock.mockResolvedValue({
+      agent: {
+        acp_backend: '',
+        custom_acp: { command: 'my-acp', args: ['serve'], gate_option: 'mode', gate_value: 'read-only' },
+      },
+    })
+    schemaMock.mockReturnValue(schemaWith(['', 'claude', 'kas', 'custom']))
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow('', card()),
+        customRow({ selectable: true, installed: 'installed', missing_components: [], ...card({ tool_approval: 'session_config' }) }),
+      ],
+    })
+    wrap()
+    await waitFor(() => expect(row('Custom ACP')).toBeInTheDocument())
+    highlight('Custom ACP')
+    const form = within(await screen.findByRole('form', { name: 'Custom ACP agent' }))
+    expect(form.getByLabelText(/^Command/)).toHaveValue('my-acp')
+    expect(form.getByLabelText(/^Arguments/)).toHaveValue('serve')
+    expect(form.getByLabelText(/^Permission option/)).toHaveValue('mode')
+    expect(form.getByLabelText(/^Permission value/)).toHaveValue('read-only')
+    await waitFor(() => expect(useButton('Custom ACP')).toBeEnabled())
+    // The graded line reads the routing the registration wrote.
+    expect(screen.getByText(/Asks before it runs a command or changes a file/)).toBeInTheDocument()
+  })
+
+  it('sends an all-empty record as a deliberate clear', async () => {
+    kirocrewConfigMock.mockResolvedValue({
+      agent: {
+        acp_backend: '',
+        custom_acp: { command: 'my-acp', args: [], gate_option: 'mode', gate_value: 'read-only' },
+      },
+    })
+    schemaMock.mockReturnValue(schemaWith(['', 'claude', 'kas', 'custom']))
+    acpBackendsMock.mockResolvedValue({
+      backends: [probeRow('', card()), customRow({ selectable: true, installed: 'installed' })],
+    })
+    acpBackendRecheckMock.mockResolvedValue({ backend: customRow() })
+    wrap()
+    await waitFor(() => expect(row('Custom ACP')).toBeInTheDocument())
+    highlight('Custom ACP')
+    const form = within(await screen.findByRole('form', { name: 'Custom ACP agent' }))
+    for (const label of [/^Command/, /^Permission option/, /^Permission value/]) {
+      fireEvent.change(form.getByLabelText(label), { target: { value: '' } })
+    }
+    fireEvent.click(form.getByRole('button', { name: 'Save' }))
+    await waitFor(() =>
+      expect(patchConfigMock).toHaveBeenCalledWith('agent.custom_acp', {
+        command: '',
+        args: [],
+        gate_option: '',
+        gate_value: '',
+      }),
+    )
+  })
+
+  it('reports a refused save beside the form', async () => {
+    patchConfigMock.mockRejectedValue(new Error('403'))
+    acpBackendsMock.mockResolvedValue({ backends: [probeRow('', card()), customRow()] })
+    wrap()
+    await waitFor(() => expect(row('Custom ACP')).toBeInTheDocument())
+    highlight('Custom ACP')
+    const form = within(await screen.findByRole('form', { name: 'Custom ACP agent' }))
+    fireEvent.change(form.getByLabelText(/^Command/), { target: { value: 'my-acp' } })
+    fireEvent.change(form.getByLabelText(/^Permission option/), { target: { value: 'mode' } })
+    fireEvent.change(form.getByLabelText(/^Permission value/), { target: { value: 'read-only' } })
+    fireEvent.click(form.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(form.getByText('Could not save the custom agent.')).toBeInTheDocument())
+    expect(acpBackendRecheckMock).not.toHaveBeenCalled()
+  })
+})

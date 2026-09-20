@@ -18,6 +18,7 @@ import pytest
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_CUSTOM,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
@@ -45,7 +46,19 @@ FIELD = "agent.acp_backend"
 #: justification. Four live captures across its confined and read-only postures raised
 #: no permission request at all. So Crew's PreToolUse gate would not run for what a
 #: session actually does, and the switch would be offering a harness Crew cannot gate.
-NOT_SHIPPED_SELECTABLE: frozenset = frozenset({ACP_BACKEND_DEEPSEEK})
+NOT_SHIPPED_SELECTABLE: frozenset = frozenset(
+    {
+        ACP_BACKEND_DEEPSEEK,
+        # The operator-named harness. Outside the baseline because at import it HAS
+        # no launch and no gate -- both arrive from ``agent.custom_acp`` -- and a
+        # switch for a harness with no command behind it is the state this test
+        # exists to refuse. ``register_custom_backend`` writes launch, routing and
+        # selectability together at config load, so the id is selectable exactly
+        # while a complete spec is configured; ``test_acp_custom_backend`` pins
+        # that lifecycle.
+        ACP_BACKEND_CUSTOM,
+    }
+)
 
 
 @pytest.fixture

@@ -1,0 +1,44 @@
+[
+  {
+    "agent_capabilities": {
+      "loadSession": false,
+      "mcpCapabilities": {
+        "http": false,
+        "sse": false
+      },
+      "promptCapabilities": {
+        "audio": false,
+        "embeddedContext": false,
+        "image": false
+      }
+    },
+    "agent_version": "0.0.0-synthetic",
+    "frame": "response",
+    "id": 1,
+    "protocol_version": 1
+  },
+  {
+    "config_options": [
+      {
+        "category": "mode",
+        "currentValue": "agent",
+        "id": "mode",
+        "name": "Mode",
+        "options": [
+          {
+            "name": "Agent",
+            "value": "agent"
+          },
+          {
+            "name": "Read only",
+            "value": "read-only"
+          }
+        ],
+        "type": "select"
+      }
+    ],
+    "frame": "response",
+    "id": 2,
+    "session_id": "custom-session-synthetic-1"
+  }
+]

@@ -47,12 +47,16 @@ from kiro_crew.acp.harness import codex as codex_harness_mod
 from kiro_crew.acp.runtime import AcpRuntime
 from kiro_crew.acp.skill_projection import NativeSkillProjection
 from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_CUSTOM,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_OPENCODE,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_KNOWN,
+    CustomAcpSpec,
+    custom_backend_spec,
+    register_custom_backend,
 )
 from kiro_crew.config import paths as config_paths
 from kiro_crew.constants import KIROCREW_SPAWN_INSTANCE_ENV
@@ -73,7 +77,21 @@ _PI_EXTENSION = "/opt/run/kiro_crew_tool_gate.ts"
 _OPENCODE_BIN = "/opt/bin/opencode"
 _GOOSE_BIN = "/opt/bin/goose"
 _DEEPSEEK_BIN = "/opt/bin/dsh"
+_CUSTOM_BIN = "/opt/bin/custom-acp"
 _SEARCH_PATH = "/opt/bin"
+
+#: The operator-named harness has no launch until a spec is registered, so the
+#: capture registers THIS one -- a fixed, obviously synthetic command -- for the
+#: duration of its spawn and restores whatever was registered before. What the
+#: golden then pins is the shape the spawn path gives an arbitrary spec: the
+#: configured command and args as the argv, nothing added, and the same
+#: environment contribution every self-served harness gets.
+_CUSTOM_SPEC = CustomAcpSpec(
+    command="custom-acp",
+    args=("--acp",),
+    gate_option="mode",
+    gate_value="read-only",
+)
 _OPENCODE_CONFIG = '{"permission":"ask"}'
 
 #: Env keys whose VALUE is a property of the host or the run. The key still has to
@@ -354,10 +372,11 @@ def _stub_common(stack: list, rec: _Recorder, tmp_path: Path) -> None:
             patch.object(
                 client_mod,
                 "_resolve_self_served_bin",
-                side_effect=lambda backend: {
+                side_effect=lambda backend, launch=None: {
                     ACP_BACKEND_OPENCODE: (_OPENCODE_BIN, _SEARCH_PATH),
                     ACP_BACKEND_GOOSE: (_GOOSE_BIN, _SEARCH_PATH),
                     ACP_BACKEND_DEEPSEEK: (_DEEPSEEK_BIN, _SEARCH_PATH),
+                    ACP_BACKEND_CUSTOM: (_CUSTOM_BIN, _SEARCH_PATH),
                 }[backend],
             ),
         ]
@@ -384,6 +403,7 @@ def snapshot_bin_caches() -> dict[str, Any]:
     """
     saved: dict[str, Any] = {name: getattr(client_mod, name) for name in _ADAPTER_CACHE_NAMES}
     saved["_self_served_bin_caches"] = dict(client_mod._self_served_bin_caches)
+    saved["_self_served_bin_cache_records"] = dict(client_mod._self_served_bin_cache_records)
     return saved
 
 
@@ -400,6 +420,8 @@ def restore_bin_caches(saved: dict[str, Any]) -> None:
         setattr(client_mod, name, saved[name])
     client_mod._self_served_bin_caches.clear()
     client_mod._self_served_bin_caches.update(saved["_self_served_bin_caches"])
+    client_mod._self_served_bin_cache_records.clear()
+    client_mod._self_served_bin_cache_records.update(saved["_self_served_bin_cache_records"])
 
 
 def _reset_bin_caches() -> None:
@@ -408,6 +430,7 @@ def _reset_bin_caches() -> None:
     for name in _ADAPTER_CACHE_NAMES:
         setattr(client_mod, name, unresolved)
     client_mod._self_served_bin_caches.clear()
+    client_mod._self_served_bin_cache_records.clear()
 
 
 #: Hosts launched ONLY by ``AcpRuntime``. The kiro family is on the runtime too but
@@ -565,6 +588,13 @@ def capture(backend: str, tmp_path: Path) -> dict[str, Any]:
     # without the restore a later test in the same worker reads that fiction.
     saved_caches = snapshot_bin_caches()
     _reset_bin_caches()
+    # The operator-named harness is launched from whatever spec is registered, so
+    # the capture registers its fixed one and puts the previous registration back
+    # in ``finally`` -- ``None`` unregisters, which is the ordinary state of a test
+    # process.
+    previous_custom_spec = custom_backend_spec()
+    if backend == ACP_BACKEND_CUSTOM:
+        register_custom_backend(_CUSTOM_SPEC)
     stack: list = [patch.dict(os.environ, parent_env, clear=True)]
     _stub_common(stack, rec, tmp_path)
     entered: list = []
@@ -589,6 +619,8 @@ def capture(backend: str, tmp_path: Path) -> dict[str, Any]:
             except Exception:  # pragma: no cover - teardown must not mask a failure
                 pass
         restore_bin_caches(saved_caches)
+        if backend == ACP_BACKEND_CUSTOM:
+            register_custom_backend(previous_custom_spec)
     added, _removed = _env_delta(inherited_env, rec.env)
     return {
         "argv": rec.argv,

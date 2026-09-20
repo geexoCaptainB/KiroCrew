@@ -448,6 +448,7 @@ def test_the_payload_carries_every_field_the_panel_reads() -> None:
         # several absent fields. Its own shape is pinned in
         # ``test_backend_mcp_ability``.
         "mcp",
+        "configurable",
     }
     capabilities = payload["capabilities"]
     assert isinstance(capabilities, list)
@@ -461,6 +462,8 @@ def test_the_payload_carries_every_field_the_panel_reads() -> None:
     # reader needs, and a shipped gateway cannot take a wire field back.
     assert payload["tool_approval"] == Routing.AGENT_SPEC.value
     assert payload["offered_by_build"] is True
+    # kiro-cli's launch is the build's, not the operator's.
+    assert payload["configurable"] is False
     # The two note lists are separate ON THE WIRE, because the panel renders them
     # in two places: one outside every disclosure, one behind it.
     assert cards_mod.NOTE_CREW_SANDBOX_STANDS_DOWN in payload["security_notes"]

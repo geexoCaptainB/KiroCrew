@@ -272,6 +272,10 @@ class TestConfigSchemaProperties:
                 for key, node in props.items():
                     reachable_paths.add(f"{prefix}.{key}")
                     if isinstance(node, dict):
+                        # A declared array or object node flattens a wildcard child
+                        # the same way a dataclass list/dict field does above.
+                        if node.get("type") in ("array", "object"):
+                            reachable_paths.add(f"{prefix}.{key}.*")
                         _add_declared(f"{prefix}.{key}", node.get("properties"))
 
             _add_declared(path, (f.metadata or {}).get("properties"))

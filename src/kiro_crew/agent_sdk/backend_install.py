@@ -47,6 +47,7 @@ from typing import Callable, Dict, List, Tuple
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_CUSTOM,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKEND_PI,
@@ -54,6 +55,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_SELF_SERVED_ACP,
     POLICY_ID_BY_BACKEND,
+    custom_backend_spec,
     launch_for,
 )
 from kiro_crew.agent_sdk.drivers import acp as acp_driver
@@ -98,6 +100,11 @@ COMPONENT_CODEX_ACP_ADAPTER = ACP_BACKEND_PROCESS_NAMES[ACP_BACKEND_CODEX]
 #: ``pi`` agent that adapter spawns in turn. Either can be absent on its own.
 COMPONENT_PI_ACP_ADAPTER = ACP_BACKEND_PROCESS_NAMES[ACP_BACKEND_PI]
 COMPONENT_PI_CLI = "pi"
+
+#: What an UNCONFIGURED custom harness is missing. Not a binary -- there is none to
+#: name until the operator names it -- but the config block itself, spelled as the
+#: path the operator writes so the row's remedy and the field agree.
+COMPONENT_CUSTOM_ACP_SPEC = "agent.custom_acp"
 
 #: How long a verdict is reused. The Claude driver shells out to mise and globs
 #: the filesystem, and the dashboard polls this endpoint, so an uncached probe
@@ -294,6 +301,36 @@ def _probe_self_served(backend: str) -> BackendInstallState:
     )
 
 
+def _probe_custom() -> BackendInstallState:
+    """The operator-named harness: unconfigured, or probed by its own launch record.
+
+    Two questions in order, because the second has no meaning without the first.
+    While no complete ``agent.custom_acp`` is registered there is no binary to look
+    for, and the honest verdict is MISSING with the CONFIG BLOCK as the component:
+    that is what the operator has to supply, and naming a binary here would name
+    one Crew invented. Once a spec is registered the id has a launch row like every
+    self-served harness, and :func:`_probe_self_served` answers from it -- the
+    configured command is what the ladder searches for and what the row names when
+    it is absent, and the install command it prints is the record's own, which for
+    this harness says where the command came from rather than pretending to know an
+    installer.
+
+    A probe of its own rather than a generated ``_PROBES`` row because the
+    generated rows are bound at import from :data:`ACP_BACKENDS_SELF_SERVED_ACP`,
+    which custom is outside of by construction: its launch row exists only while a
+    spec does.
+    """
+    if custom_backend_spec() is None:
+        return BackendInstallState(
+            ACP_BACKEND_CUSTOM,
+            _policy_id(ACP_BACKEND_CUSTOM),
+            MISSING,
+            (COMPONENT_CUSTOM_ACP_SPEC,),
+            "set agent.custom_acp (command, args, gate_option, gate_value) in config.json",
+        )
+    return _probe_self_served(ACP_BACKEND_CUSTOM)
+
+
 def _probe_codex() -> BackendInstallState:
     """The Codex backend needs one component, and names it when it is absent.
 
@@ -374,6 +411,7 @@ _PROBES: Dict[str, Callable[[], BackendInstallState]] = {
     ACP_BACKEND_CLAUDE: _probe_claude,
     ACP_BACKEND_CODEX: _probe_codex,
     ACP_BACKEND_PI: _probe_pi,
+    ACP_BACKEND_CUSTOM: _probe_custom,
     # Every harness that serves ACP from its own binary is probed by the one function
     # above, bound to its id. Generated from the membership rather than listed, so
     # onboarding a harness of that shape adds no row here at all -- and a harness with

@@ -849,6 +849,7 @@ class TestEndpointPayloadShape:
         assert [r["policy_id"] for r in rows] == [
             "claude",
             "codex",
+            "custom",
             "deepseek",
             "goose",
             "kas",
@@ -875,6 +876,7 @@ class TestEndpointPayloadShape:
                 "operator_notes",
                 "tool_approval",
                 "offered_by_build",
+                "configurable",
                 # The card's MCP half, and the one part of it that is NESTED rather
                 # than spread: its fields answer one question together, and a panel
                 # served by a gateway that predates them tests one absent object

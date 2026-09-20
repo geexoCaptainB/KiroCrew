@@ -362,6 +362,12 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "which verb restores a session, and which capability advertises it. The "
         "user reopens a chat either way"
     ),
+    "ACP_BACKENDS_OPERATOR_CONFIGURED": (
+        "whether a harness's launch and gate come from config.json rather than the "
+        "build. Read by this module for one field only, offered_by_build, so the "
+        "row is never a build exclusion; the install verdict beside it already says "
+        "what the operator has to supply, and a line saying it twice would be noise"
+    ),
     "ACP_BACKENDS_SELF_SERVED_ACP": (
         "whether a harness's whole launch is a row of ACP_BACKEND_LAUNCH, so the "
         "spawn path, the install probe and the driver seams resolve argv from that "
@@ -535,7 +541,17 @@ def card_for(backend: str) -> BackendCard:
         security_notes=tuple(spec.id for spec in SECURITY_LINES if _holds(backend, spec)),
         operator_notes=tuple(spec.id for spec in OPERATOR_LINES if _holds(backend, spec)),
         tool_approval=backends.routing_for(backend).value,
-        offered_by_build=backend in backends.registered_backends(),
+        # The operator-named harness IS offered by this build -- behind a config
+        # block rather than an install -- so it is never a build exclusion, whatever
+        # the registry says right now. Read as "not offered" it would tell the reader
+        # there is nothing to do, when the row's own install verdict names exactly
+        # what to do: supply ``agent.custom_acp``. Unregistered, it stays
+        # unselectable through the ordinary gate; this field is only the panel's
+        # answer to "is that mine to fix", and for this id it is.
+        offered_by_build=(
+            backend in backends.registered_backends()
+            or backend in backends.ACP_BACKENDS_OPERATOR_CONFIGURED
+        ),
     )
 
 
@@ -567,4 +583,11 @@ def card_payload(backend: str) -> Dict[str, object]:
         # from one source, and a reader on an older gateway gets an absent object
         # it can test once instead of four fields it has to test apart.
         "mcp": ability_payload(backend),
+        # Whether this harness's launch and gate are the OPERATOR's to supply, from
+        # config, rather than the build's. The panel needs it to tell "not selectable
+        # because not configured yet" -- a row it lists with a form -- from "not
+        # selectable because this deployment's policy denies it" -- a row it hides.
+        # Both read as selectable=false and offered_by_build=true on the wire, and
+        # nothing else on the row separates them.
+        "configurable": card.backend in backends.ACP_BACKENDS_OPERATOR_CONFIGURED,
     }

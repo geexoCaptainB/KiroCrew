@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Bot,
@@ -10,18 +10,21 @@ import {
   Download,
   Minus,
   RotateCw,
+  SlidersHorizontal,
   Sparkles,
   Terminal,
+  Wrench,
   X,
 } from 'lucide-react'
 
 import { api } from '../../api/client'
-import type { AcpBackendProbe } from '../../api/client'
+import type { AcpBackendInstalled, AcpBackendProbe } from '../../api/client'
 import ErrorBoundary from '../../components/ErrorBoundary'
 import ErrorNotice from '../../components/ErrorNotice'
 import { SettingsCard } from '../../components/settings'
 import { CopyCommandButton } from '../../components/settingRef/CopyCommandButton'
 import { useConfigSchema } from '../../components/settingRef/useConfigSchema'
+import { fmtList } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 import { clearCachedModels } from '../../providers/adapters/acp'
 import { KiroSignInCard } from './KiroSignInCard'
@@ -38,6 +41,29 @@ const CONFIG_KEY = 'agent.acp_backend'
 const KIRO = ''
 const CLAUDE = 'claude'
 const KAS = 'kas'
+/**
+ * The operator-named harness. The ONE id whose command and permission gate come
+ * from config rather than from the build, so it is also the one row that carries a
+ * form. Named here because the form's fields are this id's and nobody else's; every
+ * other fact about it still arrives from the server like any other row.
+ */
+const CUSTOM = 'custom'
+
+/** The config field the form owns: one record, written atomically. */
+const CUSTOM_CONFIG_KEY = 'agent.custom_acp'
+
+/**
+ * The record `agent.custom_acp` holds, in the shape the server stores and validates.
+ * `args` is a list on the wire; the form edits it one argument per line.
+ */
+type CustomAcpRecord = {
+  command: string
+  args: string[]
+  gate_option: string
+  gate_value: string
+}
+
+const EMPTY_CUSTOM: CustomAcpRecord = { command: '', args: [], gate_option: '', gate_value: '' }
 
 /**
  * The agents this frontend has a translated name and an icon for.
@@ -313,7 +339,9 @@ export function AgentBackendTab() {
   const rowRefs = useRef<Record<string, HTMLButtonElement | null>>({})
   const schema = useConfigSchema()
 
-  const cfgQ = useQuery<{ agent?: { acp_backend?: string } }>({
+  const cfgQ = useQuery<{
+    agent?: { acp_backend?: string; custom_acp?: Partial<CustomAcpRecord> }
+  }>({
     queryKey: ['kirocrewConfig'],
     queryFn: () => api.kirocrewConfig(),
   })
@@ -507,6 +535,32 @@ export function AgentBackendTab() {
     probe(value)?.offered_by_build === false && unavailable(value)
 
   /**
+   * A harness whose command and gate are the OPERATOR's to supply, from the server's
+   * own classification. Listed even while unselectable, because unselectable here
+   * means "not configured yet" and the row is where it gets configured -- the one
+   * state in which an unselectable, build-offered row is the reader's to fix rather
+   * than a policy denial to hide.
+   */
+  const configurable = (value: string) => probe(value)?.configurable === true
+  /**
+   * Whether the operator has already written the custom record. Read from the stored
+   * config rather than from the probe, because `configurable` is a standing
+   * classification of the harness ("its command is the operator's to supply") and
+   * says nothing about whether one has been supplied yet.
+   */
+  const customConfigured =
+    typeof cfgQ.data?.agent?.custom_acp?.command === 'string' &&
+    cfgQ.data.agent.custom_acp.command.trim() !== ''
+  /**
+   * Configurable, not yet selectable, AND no record stored: the form is the whole
+   * detail, no Use button. The third clause is what keeps a configured harness that
+   * the deployment's policy denies from reading as "not set up yet" -- that row is a
+   * policy denial like any other, and `rows` below hides it like any other.
+   */
+  const unconfigured = (value: string) =>
+    configurable(value) && unavailable(value) && !customConfigured
+
+  /**
    * Every agent id this panel could render, from the SERVER rather than a literal.
    *
    * This used to be `[KIRO, CLAUDE, KAS]`, which quietly made the panel the last
@@ -589,9 +643,16 @@ export function AgentBackendTab() {
    * fact the detail already carries. Hiding them answers the question with silence,
    * and offering them would be a switch whose PATCH is refused.
    *
-   * Deployment-denied agents stay out — that is `offered`'s rule and it is unchanged.
+   * Deployment-denied agents stay out — that is `offered`'s rule and it is unchanged,
+   * and it holds for the operator-named harness too: only its UNCONFIGURED state is
+   * listed while unselectable, because that is the one unselectable state the reader
+   * can fix from this panel. A configured custom harness the policy denies is hidden
+   * exactly like a denied built-in, rather than shown with a form whose save cannot
+   * make it selectable.
    */
-  const rows = candidates.filter(value => offered.includes(value) || buildExcluded(value))
+  const rows = candidates.filter(
+    value => offered.includes(value) || buildExcluded(value) || unconfigured(value),
+  )
 
   /**
    * The row whose detail is on screen.
@@ -707,12 +768,14 @@ export function AgentBackendTab() {
     [KIRO]: i18nT('pages.developer.agentBackendTab.kiro_cli'),
     [CLAUDE]: i18nT('pages.developer.agentBackendTab.claude_code'),
     [KAS]: i18nT('pages.developer.agentBackendTab.kas_kiro_agent'),
+    [CUSTOM]: i18nT('pages.developer.agentBackendTab.custom_acp'),
   }
 
   const ICON: Record<string, React.ReactNode> = {
     [KIRO]: <Terminal size={14} />,
     [CLAUDE]: <Sparkles size={14} />,
     [KAS]: <Bot size={14} />,
+    [CUSTOM]: <Wrench size={14} />,
   }
 
   /**
@@ -955,6 +1018,11 @@ export function AgentBackendTab() {
   const status = (value: string): string => {
     const row = probe(value)
     if (buildExcluded(value)) return i18nT('pages.developer.agentBackendTab.not_offered_by_this_build')
+    // Before the missing line: the server's install verdict for an unconfigured
+    // custom harness names the CONFIG BLOCK as the missing component, which is
+    // exact and reads badly as "missing on this machine". The form below is the
+    // remedy, so the sentence points there.
+    if (unconfigured(value)) return i18nT('pages.developer.agentBackendTab.custom_not_configured')
     if (row?.installed === 'missing')
       return i18nT('pages.developer.agentBackendTab.missing_components', {
         components: row.missing_components.join(', '),
@@ -976,6 +1044,9 @@ export function AgentBackendTab() {
     if (row?.restart_required)
       return i18nT('pages.developer.agentBackendTab.installed_check_again_to_use')
     if (value === KIRO) return i18nT('pages.developer.agentBackendTab.default_all_features_supported')
+    // A configured custom row gets a sentence, not the one-word fall-through: the
+    // bare "Experimental" strip sits directly above real inputs and reads as one.
+    if (value === CUSTOM) return i18nT('pages.developer.agentBackendTab.custom_descriptor')
     return i18nT('pages.developer.agentBackendTab.experimental')
   }
 
@@ -995,6 +1066,10 @@ export function AgentBackendTab() {
    */
   const readinessGlyph = (value: string): React.ReactNode => {
     if (buildExcluded(value)) return <Minus size={13} aria-hidden className="text-muted" />
+    // Same precedence as the word: the download arrow means "install this", and the
+    // remedy for an unconfigured custom row is the form, not an installer.
+    if (unconfigured(value))
+      return <SlidersHorizontal size={13} aria-hidden className="text-muted" />
     if (notInstalled(value)) return <Download size={13} aria-hidden className="text-warn" />
     if (needsRestart(value)) return <RotateCw size={13} aria-hidden className="text-warn" />
     // No verdict is not a verdict: a probe that did not answer gets an outline
@@ -1042,6 +1117,10 @@ export function AgentBackendTab() {
    */
   const readinessWord = (value: string): string => {
     if (buildExcluded(value)) return i18nT('pages.developer.agentBackendTab.word_not_offered')
+    // Before the missing word: nothing is absent from the MACHINE for an unconfigured
+    // custom row, the record is. "Missing" beside a strip saying "Not set up yet" is
+    // two words for one state, and the first one sends the reader to an installer.
+    if (unconfigured(value)) return i18nT('pages.developer.agentBackendTab.word_not_set_up')
     if (notInstalled(value)) return i18nT('pages.developer.agentBackendTab.word_missing')
     if (needsRestart(value)) return i18nT('pages.developer.agentBackendTab.word_recheck')
     if (!probe(value) || probe(value)?.installed === 'unknown')
@@ -1070,6 +1149,9 @@ export function AgentBackendTab() {
   // that re-measured the machine would answer a question nobody asked.
   const canRecheck =
     !buildExcluded(shown) &&
+    // An unconfigured custom row has no command to look for: a re-check can only
+    // re-answer "not set up yet", so the button would be a control that does nothing.
+    !unconfigured(shown) &&
     (notInstalled(shown) || needsRestart(shown) || probe(shown)?.installed === 'unknown')
 
   return (
@@ -1281,7 +1363,7 @@ export function AgentBackendTab() {
                 </span>
               )}
               {status(shown)}
-              {install && notInstalled(shown) && (
+              {install && notInstalled(shown) && !unconfigured(shown) && (
                 <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
                   {/* Named for a screen reader and not on screen: the command sits
                       directly under "Missing on this machine: X" with a Copy command
@@ -1481,7 +1563,30 @@ export function AgentBackendTab() {
                 STRIP and not the panel, so the reason a dead button is dead is the one
                 sentence a screen reader gets — naming the panel would read the whole
                 card out, this button included. */}
-            {!buildExcluded(shown) && (
+            {configurable(shown) && (
+              <CustomAcpForm
+                stored={cfgQ.data?.agent?.custom_acp}
+                // The row's own verdict, so the status line beside Save can close
+                // with what the re-check found instead of stopping at "checking".
+                installed={probe(shown)?.installed}
+                probeStamp={probeQ.dataUpdatedAt}
+                checking={recheckMut.isPending || probeQ.isFetching}
+                checkFailed={recheckMut.isError && recheckMut.variables === shown}
+                onSaved={() => {
+                  // The load that follows the write is what registers (or
+                  // unregisters) the harness, so every reader of the selectable set
+                  // is stale: the config, the schema the PATCH allowlist mirrors, and
+                  // the probe rows. The re-check then re-takes THIS row's install
+                  // verdict with the running process's cached resolution dropped, so
+                  // a command that just became configured is measured, not remembered.
+                  qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+                  qc.invalidateQueries({ queryKey: ['config-schema'] })
+                  qc.invalidateQueries({ queryKey: ['acpBackends'] })
+                  recheckMut.mutate(shown)
+                }}
+              />
+            )}
+            {!buildExcluded(shown) && !unconfigured(shown) && (
               <div className="mt-3 flex justify-end">
                 {/* Raised and bordered only while it can actually be pressed. A dead
                     click on the panel's ONE mutating control is answered by silence, so
@@ -1549,5 +1654,375 @@ export function AgentBackendTab() {
         </ErrorBoundary>
       )}
     </>
+  )
+}
+
+/**
+ * The form that names the operator's own ACP harness.
+ *
+ * Four fields and one write. The record is saved WHOLE through `agent.custom_acp`
+ * because a command with no gate, or a gate with no command, is not a partially
+ * configured harness but an unusable one -- the server refuses to register either,
+ * and a per-field write would leave the switch flickering between the two states as
+ * the operator typed. So the form holds a draft, checks the three required strings
+ * itself before sending (so the reader sees which is missing before a round trip),
+ * and hands the parent one `onSaved` to refresh what the write changed.
+ *
+ * What the form does NOT do is decide anything about the harness. Whether the
+ * command exists is the install row's answer; whether the gate option is real is the
+ * session's, refused at start with the option named if the harness does not
+ * advertise it. The intro says so in as many words, because the operator is making
+ * a claim by filling this in -- "this option makes my harness ask" -- and the form
+ * is where they should learn what happens when the claim does not hold.
+ *
+ * Args are edited one per line. A shell-style single string would need quoting
+ * rules the reader has to guess at, and the wire shape is a list already.
+ */
+function CustomAcpForm({
+  stored,
+  installed,
+  probeStamp,
+  checking,
+  checkFailed,
+  onSaved,
+}: {
+  stored: Partial<CustomAcpRecord> | undefined
+  /** The custom row's install verdict, `undefined` while the probe has none. */
+  installed: AcpBackendInstalled | undefined
+  /** When the probe data last changed; how the form knows the post-save re-check landed. */
+  probeStamp: number
+  /** A re-check or a probe fetch is in flight. */
+  checking: boolean
+  /** The re-check this form triggered was rejected; the row's strip carries the error. */
+  checkFailed: boolean
+  onSaved: () => void
+}) {
+  const initial: CustomAcpRecord = { ...EMPTY_CUSTOM, ...(stored ?? {}) }
+  const [command, setCommand] = useState(initial.command)
+  const [argsText, setArgsText] = useState((initial.args ?? []).join('\n'))
+  const [gateOption, setGateOption] = useState(initial.gate_option)
+  const [gateValue, setGateValue] = useState(initial.gate_value)
+  const [saved, setSaved] = useState(false)
+  const [removed, setRemoved] = useState(false)
+  // Removal is two clicks: the first turns the button into a question, the second
+  // answers it. The record on disk names a program and three settings the operator
+  // typed by hand, and one click on a button beside Save is not enough to be sure
+  // they meant to lose them.
+  const [confirmingRemove, setConfirmingRemove] = useState(false)
+  // Focus bookkeeping for that two-click removal. Opening the question unmounts
+  // the button that had focus; the effect below moves it to "Keep it" once that
+  // button exists. Cancelling unmounts "Keep it" in turn and asks for focus back
+  // on Remove, which is granted on the render that mounts it again.
+  const removeButtonRef = useRef<HTMLButtonElement | null>(null)
+  const keepButtonRef = useRef<HTMLButtonElement | null>(null)
+  const [focusRemove, setFocusRemove] = useState(false)
+  useEffect(() => {
+    if (confirmingRemove) keepButtonRef.current?.focus()
+  }, [confirmingRemove])
+  useEffect(() => {
+    if (focusRemove && !confirmingRemove) {
+      removeButtonRef.current?.focus()
+      setFocusRemove(false)
+    }
+  }, [focusRemove, confirmingRemove])
+  // The probe stamp at the moment the write landed. The re-check that follows a
+  // save writes a fresh row and moves the stamp past it; until then the verdict on
+  // screen is the PRE-save one and must not be reported as the outcome.
+  const [savedStamp, setSavedStamp] = useState(0)
+  const [error, setError] = useState('')
+
+  const record: CustomAcpRecord = {
+    command: command.trim(),
+    args: argsText
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line.length > 0),
+    gate_option: gateOption.trim(),
+    gate_value: gateValue.trim(),
+  }
+  // Every field empty is a deliberate CLEAR and is sent as one: it is how the
+  // operator takes the harness off the switch. Anything in between is incomplete.
+  const cleared =
+    !record.command && record.args.length === 0 && !record.gate_option && !record.gate_value
+  // Named, not counted: the warning says WHICH fields are still empty, so a reader
+  // with the command already typed is told "permission option, permission value"
+  // and not re-told to fill in the command they can see.
+  const missing = cleared
+    ? []
+    : (
+        [
+          [record.command, i18nT('pages.developer.agentBackendTab.custom_command')],
+          [record.gate_option, i18nT('pages.developer.agentBackendTab.custom_gate_option')],
+          [record.gate_value, i18nT('pages.developer.agentBackendTab.custom_gate_value')],
+        ] as const
+      )
+        .filter(([value]) => !value)
+        .map(([, label]) => label)
+  const incomplete = missing.length > 0
+  // Nothing to save: the draft IS the record on disk. Covers the empty form over an
+  // empty record, so an unconfigured row does not offer a Save that writes nothing.
+  const unchanged =
+    JSON.stringify(record) ===
+    JSON.stringify({
+      command: (initial.command ?? '').trim(),
+      args: (initial.args ?? []).map(a => a.trim()).filter(a => a.length > 0),
+      gate_option: (initial.gate_option ?? '').trim(),
+      gate_value: (initial.gate_value ?? '').trim(),
+    })
+
+  const saveMut = useMutation({
+    mutationFn: (value: CustomAcpRecord) => api.patchConfig(CUSTOM_CONFIG_KEY, value),
+    onSuccess: (_data, value) => {
+      setError('')
+      setSaved(true)
+      // A write of the empty record is a removal, and its outcome is "gone", not the
+      // install verdict a re-check of an unwritten record would return.
+      setRemoved(!value.command)
+      setSavedStamp(probeStamp)
+      onSaved()
+    },
+    onError: () => {
+      setSaved(false)
+      setError(i18nT('pages.developer.agentBackendTab.custom_could_not_save'))
+    },
+  })
+  const cannotSave = incomplete || unchanged || saveMut.isPending
+  // The record on disk names a command: there is an agent to remove. The button is
+  // the one visible path to removal; clearing every field and saving still works
+  // but is not something a reader would try unprompted.
+  const removable = Boolean((initial.command ?? '').trim()) && !saveMut.isPending
+  const remove = () => {
+    setConfirmingRemove(false)
+    setCommand('')
+    setArgsText('')
+    setGateOption('')
+    setGateValue('')
+    setSaved(false)
+    saveMut.mutate(EMPTY_CUSTOM)
+  }
+
+  // The line beside Save, after a write: "checking" only while the re-check the
+  // save started is still out, then what it found, held until the next edit. A
+  // verdict that ends nowhere -- the probe has no answer, or the re-check was
+  // rejected and the row's strip already says so -- shows nothing rather than a
+  // "checking" that is no longer true.
+  const settled = !checking && probeStamp > savedStamp
+  const savedMessage = !saved || incomplete
+    ? null
+    : removed
+      ? i18nT('pages.developer.agentBackendTab.custom_removed')
+      : checkFailed
+        ? null
+        : !settled
+          ? i18nT('pages.developer.agentBackendTab.custom_saved')
+          : installed === 'installed'
+            ? i18nT('pages.developer.agentBackendTab.custom_saved_found')
+            : installed === 'missing'
+              ? i18nT('pages.developer.agentBackendTab.custom_saved_missing')
+              : null
+
+  const field = (
+    id: string,
+    label: string,
+    help: string,
+    value: string,
+    onChange: (next: string) => void,
+    placeholder: string,
+  ) => (
+    <div className="text-[11px] text-muted">
+      <label id={`${id}-label`} htmlFor={id} className="block font-semibold text-text-strong">
+        {label}
+      </label>
+      <input
+        id={id}
+        type="text"
+        value={value}
+        placeholder={i18nT('pages.developer.agentBackendTab.custom_placeholder_example', {
+          value: placeholder,
+        })}
+        spellCheck={false}
+        autoComplete="off"
+        aria-labelledby={`${id}-label`}
+        aria-describedby={`${id}-help`}
+        onChange={e => {
+          setSaved(false)
+          onChange(e.target.value)
+        }}
+        className="mt-0.5 block w-full rounded-md border border-border bg-bg-elevated px-2 py-1 font-mono text-[12px] text-text-strong"
+      />
+      <span id={`${id}-help`} className="block mt-0.5 leading-relaxed">
+        {help}
+      </span>
+    </div>
+  )
+
+  return (
+    <form
+      className="mt-3 space-y-2 rounded-md border border-border px-2.5 py-2"
+      aria-labelledby="custom-acp-form-heading"
+      onSubmit={e => {
+        e.preventDefault()
+        if (cannotSave) return
+        saveMut.mutate(cleared ? EMPTY_CUSTOM : record)
+      }}
+    >
+      {/* Visible, not aria-only: the row's "Use Custom ACP" button sits just above
+          this form, and a reader took it for the form's Save. A heading that names
+          what the box below is for separates the two. */}
+      <h4
+        id="custom-acp-form-heading"
+        className="mb-0 text-[12px] font-semibold text-text-strong"
+      >
+        {i18nT('pages.developer.agentBackendTab.custom_form')}
+      </h4>
+      <p className="mb-0 text-[11px] leading-relaxed text-muted">
+        {i18nT('pages.developer.agentBackendTab.custom_intro')}
+      </p>
+      {field(
+        'custom-acp-command',
+        i18nT('pages.developer.agentBackendTab.custom_command'),
+        i18nT('pages.developer.agentBackendTab.custom_command_help'),
+        command,
+        setCommand,
+        'my-acp-agent',
+      )}
+      <div className="text-[11px] text-muted">
+        <label
+          id="custom-acp-args-label"
+          htmlFor="custom-acp-args"
+          className="block font-semibold text-text-strong"
+        >
+          {i18nT('pages.developer.agentBackendTab.custom_args')}
+        </label>
+        <textarea
+          id="custom-acp-args"
+          value={argsText}
+          rows={2}
+          spellCheck={false}
+          aria-labelledby="custom-acp-args-label"
+          aria-describedby="custom-acp-args-help"
+          onChange={e => {
+            setSaved(false)
+            setArgsText(e.target.value)
+          }}
+          className="mt-0.5 block w-full rounded-md border border-border bg-bg-elevated px-2 py-1 font-mono text-[12px] text-text-strong"
+        />
+        <span id="custom-acp-args-help" className="block mt-0.5 leading-relaxed">
+          {i18nT('pages.developer.agentBackendTab.custom_args_help')}
+        </span>
+      </div>
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+        {field(
+          'custom-acp-gate-option',
+          i18nT('pages.developer.agentBackendTab.custom_gate_option'),
+          i18nT('pages.developer.agentBackendTab.custom_gate_option_help'),
+          gateOption,
+          setGateOption,
+          'mode',
+        )}
+        {field(
+          'custom-acp-gate-value',
+          i18nT('pages.developer.agentBackendTab.custom_gate_value'),
+          i18nT('pages.developer.agentBackendTab.custom_gate_value_help'),
+          gateValue,
+          setGateValue,
+          'read-only',
+        )}
+      </div>
+      <p className="mb-0 text-[11px] leading-relaxed text-muted">
+        {i18nT('pages.developer.agentBackendTab.custom_no_tools')}
+      </p>
+      {/* What the operator is asserting by saving, stated where they save it: the
+          gate pair's MEANING is theirs to vouch for, because the host can verify
+          the option is advertised and applied but not what it does. */}
+      <p
+        className="mb-0 text-[11px] leading-relaxed text-muted"
+        data-testid="custom-acp-attestation"
+      >
+        {i18nT('pages.developer.agentBackendTab.custom_attestation')}
+      </p>
+      {/* Two rows, never one: the removal question and its two answers sit above
+          the Save row, so no row ever shows more than two buttons, and the Remove
+          button that opened the question is gone from the Save row while it is
+          open. Focus follows the question -- the button the reader pressed
+          unmounts, so it lands on "Keep it" (the safe answer) and comes back to
+          Remove on cancel. */}
+      {removable && confirmingRemove && (
+        <div role="group" aria-labelledby="custom-acp-remove-question" className="space-y-1">
+          <p id="custom-acp-remove-question" className="mb-0 text-right text-[11px] text-warn">
+            {i18nT('pages.developer.agentBackendTab.custom_remove_question')}
+          </p>
+          <div className="flex items-center justify-end gap-2">
+            <button
+              type="button"
+              ref={keepButtonRef}
+              onClick={() => {
+                setConfirmingRemove(false)
+                setFocusRemove(true)
+              }}
+              className="rounded-md border border-border bg-bg-elevated px-3 py-[5px] text-[13px] text-text-strong cursor-pointer hover:bg-bg-hover"
+            >
+              {i18nT('pages.developer.agentBackendTab.custom_remove_cancel')}
+            </button>
+            <button
+              type="button"
+              onClick={remove}
+              className="rounded-md border border-danger/30 bg-bg-elevated px-3 py-[5px] text-[13px] text-danger cursor-pointer hover:bg-bg-hover"
+            >
+              {i18nT('pages.developer.agentBackendTab.custom_remove_confirm')}
+            </button>
+          </div>
+        </div>
+      )}
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        {/* A live status line, not a toast: the fact it reports -- the record is on
+            disk and the row is re-measuring -- belongs beside the button that made
+            it true, and it clears the moment the draft changes again. */}
+        {incomplete && (
+          <span role="status" className="text-[11px] text-warn">
+            {i18nT('pages.developer.agentBackendTab.custom_incomplete', {
+              fields: fmtList(missing, { type: 'conjunction' }),
+            })}
+          </span>
+        )}
+        {savedMessage && (
+          <span role="status" className="text-[11px] text-muted">
+            {savedMessage}
+          </span>
+        )}
+        {removable && !confirmingRemove && (
+          <button
+            type="button"
+            ref={removeButtonRef}
+            onClick={() => setConfirmingRemove(true)}
+            className="rounded-md border border-border bg-bg-elevated px-3 py-[5px] text-[13px] text-text-strong cursor-pointer hover:bg-bg-hover"
+          >
+            {i18nT('pages.developer.agentBackendTab.custom_remove')}
+          </button>
+        )}
+        <button
+          type="submit"
+          disabled={cannotSave}
+          className={`rounded-md border px-3 py-[5px] text-[13px] font-semibold transition-colors ${
+            cannotSave
+              ? 'border-transparent bg-transparent text-muted opacity-40 cursor-not-allowed'
+              : 'border-border-strong bg-bg-elevated text-text-strong shadow-sm cursor-pointer hover:bg-bg-hover'
+          }`}
+        >
+          {saveMut.isPending
+            ? i18nT('pages.developer.agentBackendTab.custom_saving')
+            : i18nT('pages.developer.agentBackendTab.custom_save')}
+        </button>
+      </div>
+      {error && (
+        /* No hand-off: this notice sits inside the Custom ACP form, beside the
+           command, arguments and permission-option fields the operator has typed
+           but not yet saved -- a failed save is exactly when they are unsaved.
+           `askAgent` navigates to the chat and unmounts this tree, and the draft
+           would go with it. The status strip above the form carries the same
+           error once the record IS saved, and that surface hands off. */
+        <ErrorNotice message={error} variant="inline" onDismiss={() => setError('')} />
+      )}
+    </form>
   )
 }

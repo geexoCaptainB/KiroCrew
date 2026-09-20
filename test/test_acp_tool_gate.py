@@ -29,6 +29,7 @@ from kiro_crew import platform_compat
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_CUSTOM,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
@@ -447,6 +448,12 @@ def test_every_enforced_harness_reaches_the_spawn_preflight() -> None:
         for backend, routing in ACP_BACKEND_ROUTING.items()
         if routing in gate.ENFORCED_ROUTINGS
     }
+    # The operator-named harness's routing row reads ``UNVERIFIED`` at import --
+    # config load rewrites it to ``SESSION_CONFIG``, which is enforced -- but its
+    # client arm is unconditional code, so it is counted as enforced here whether or
+    # not this process has a spec registered. Counting it only when registered would
+    # let the arm lose its preflight in a test run that never configures one.
+    enforced.add(ACP_BACKEND_CUSTOM)
     assert enforced, "the gate enforces no mechanism; this ratchet would be vacuous"
 
     def _preflight_calls(fn: object) -> int:

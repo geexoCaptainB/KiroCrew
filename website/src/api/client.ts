@@ -1426,6 +1426,15 @@ export interface AcpBackendProbe {
     costs_whole_server?: boolean
     ineffective: string[]
   }
+  /**
+   * Whether this harness's command and permission gate are the OPERATOR's to
+   * supply from config, rather than the build's. A configurable harness that is
+   * not selectable is one nobody has configured yet -- the panel lists it with
+   * the form that configures it -- where every other unselectable-but-offered
+   * row is a policy denial the panel hides. OPTIONAL like every card field: a
+   * gateway that predates it sends none, and absent reads as "not configurable".
+   */
+  configurable?: boolean
 }
 
 let _sessionExpiredShown = false

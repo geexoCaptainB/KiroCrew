@@ -43,6 +43,13 @@ from kiro_crew import (
     platform_compat,
     windows_acl,
 )
+
+# The operator-named ACP harness is registered from HERE, on the load path, because
+# this is the one place that sees ``agent.custom_acp`` before ``agent.acp_backend``
+# is normalized against the selectable set -- the ordering that lets a persisted
+# ``"custom"`` survive the load. Same leaf ``sections`` already imports at module
+# scope, for the same reason: it reaches nothing in ``kiro_crew.acp``.
+from kiro_crew.acp_backends import coerce_custom_acp_spec, register_custom_backend
 from kiro_crew.agent_sdk.capabilities import MODEL_NAMESPACE_ACP, capabilities_for
 from kiro_crew.agent_spec_format import iter_agent_spec_files, parse_agent_spec_text
 
@@ -2544,7 +2551,39 @@ def _invalidate_config_cache() -> None:
 # Build each section in its own frame: the large inline constructor amplifies
 # line-tracing cost on every load. These helpers create fresh values, never
 # cache configuration, and leave resolution and admission checks unchanged.
+def _register_custom_acp(agent_data: dict) -> dict[str, object]:
+    """Register (or unregister) the operator-named harness from ``agent.custom_acp``.
+
+    Runs on EVERY config load, before the ``acp_backend`` normalization below, so
+    the selectable set reflects the file being loaded: a block that appeared makes
+    ``"custom"`` selectable on this load, and a block that was blanked takes it off
+    the switch on this load -- with the persisted ``acp_backend: "custom"`` then
+    degrading to the default through the one gate every unusable value takes,
+    with its reason logged.
+
+    An INCOMPLETE block is a refusal, not a crash: the leaf unregisters and raises
+    naming every gap, and the gaps are logged here so an operator who wrote three
+    of the four keys reads which one is missing rather than a bare "not
+    selectable". The load itself proceeds, because a half-written harness block
+    must never make the whole config unloadable.
+
+    Returns the normalized block for the ``AgentConfig`` field, so the stored shape
+    and the registered spec are read from the same value.
+    """
+    normalized = _sections.coerce_custom_acp(agent_data.get("custom_acp"))
+    spec = coerce_custom_acp_spec(normalized)
+    try:
+        register_custom_backend(spec)
+    except ValueError as exc:
+        logger.warning("Custom ACP harness not registered: %s", exc)
+    return normalized
+
+
 def _build_agent_config(agent_data: dict) -> AgentConfig:
+    # Registration FIRST: ``_normalize_acp_backend`` below reads the selectable set
+    # this writes, and reversing the order would degrade a persisted ``"custom"`` on
+    # every load.
+    custom_acp = _register_custom_acp(agent_data)
     return AgentConfig(
         approval_mode=agent_data.get("approval_mode", "auto"),
         streaming=agent_data.get("streaming", True),
@@ -2563,6 +2602,7 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         ),
         acp_backend=_normalize_acp_backend(agent_data.get("acp_backend")),
         member_acp_backend=_normalize_acp_backend(agent_data.get("member_acp_backend", "kas")),
+        custom_acp=custom_acp,
         default_agent=agent_data.get("default_agent", ""),
         sweep_agents_backups=_safe_bool(agent_data.get("sweep_agents_backups", False), False),
         sandbox=agent_data.get("sandbox", "auto"),

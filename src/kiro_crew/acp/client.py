@@ -99,6 +99,7 @@ from kiro_crew.acp.session_mcp import agent_spec_snapshot, session_mcp_deny_rule
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_CUSTOM,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KIRO,
@@ -192,7 +193,10 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_LAUNCH,
     ACP_BACKEND_NODE_ADAPTER_PACKAGES,
     ACP_BACKEND_PROCESS_NAMES,
+    CUSTOM_ACP_PROTOCOL_VERSION,
     NODE_ADAPTER_ENTRY_SEGMENTS,
+    SelfServedLaunch,
+    custom_backend_spec,
     launch_for,
 )
 from kiro_crew.atomic_write import atomic_write
@@ -293,6 +297,11 @@ PROTOCOL_VERSION_GOOSE = launch_for(ACP_BACKEND_GOOSE).protocol_version
 # so it speaks the SPEC dialect too. Verified off its own wire, and its own literal
 # for the same reason the two above have one (harness-parity H10).
 PROTOCOL_VERSION_DEEPSEEK = launch_for(ACP_BACKEND_DEEPSEEK).protocol_version
+# The operator-named harness speaks ACP v1 by requirement rather than by capture:
+# the ``configOptions`` gate it must advertise is defined there. Its literal lives
+# in the leaf, because the launch row this dialect would otherwise be read from is
+# written at config load -- after this table is built -- so the row here is static.
+PROTOCOL_VERSION_CUSTOM = CUSTOM_ACP_PROTOCOL_VERSION
 #: Handshake dialect per harness. A TABLE, not an if-chain: the handshake runs on
 #: the construction path kiro-cli shares with every adapter, and harness-parity H13
 #: keeps that path free of conditionals added in service of one. A harness added
@@ -300,6 +309,7 @@ PROTOCOL_VERSION_DEEPSEEK = launch_for(ACP_BACKEND_DEEPSEEK).protocol_version
 _PROTOCOL_VERSION_BY_BACKEND: dict[str, int | str] = {
     ACP_BACKEND_CLAUDE: PROTOCOL_VERSION_CLAUDE,
     ACP_BACKEND_PI: PROTOCOL_VERSION_PI,
+    ACP_BACKEND_CUSTOM: PROTOCOL_VERSION_CUSTOM,
     # Every harness whose own binary serves ACP declares its dialect in its
     # ``ACP_BACKEND_LAUNCH`` row, so those rows are read rather than restated here.
     # The two adapters above keep explicit rows: each is a separate package with
@@ -969,6 +979,19 @@ def _resolve_claude_acp_bin() -> tuple[list[str] | None, str]:
 #: ``(None, path)`` value means "looked, and it is not here".
 _self_served_bin_caches: dict[str, tuple[str | None, str]] = {}
 
+#: The launch record each entry in :data:`_self_served_bin_caches` was resolved FOR.
+#:
+#: A resolution is an answer about one binary name and one override variable, so it
+#: is valid exactly as long as the record that supplied them is. For the harnesses
+#: this build ships the record never changes and this table never fires. It exists
+#: for the one harness whose record is written at config load: an operator who
+#: changes ``agent.custom_acp.command`` must get the NEW command on the next spawn,
+#: not the path the old one resolved to, and without this the per-process cache
+#: would hand back the old path until a restart. Read and written beside the cache
+#: in :meth:`AcpClient._resolve_self_served_launch`, on the loop, so the
+#: check-and-drop is atomic against the readers the same way the cache itself is.
+_self_served_bin_cache_records: dict[str, SelfServedLaunch] = {}
+
 #: Per-backend resolution generation, bumped by every deliberate cache clear.
 #:
 #: The caches above are all written AFTER an ``await``: a site checks the sentinel,
@@ -1000,7 +1023,9 @@ def bump_resolution_generation(backend: str) -> None:
     _resolution_generation[backend] = _resolution_generation.get(backend, 0) + 1
 
 
-def _resolve_self_served_bin(backend: str) -> tuple[str | None, str]:
+def _resolve_self_served_bin(
+    backend: str, launch: SelfServedLaunch | None = None
+) -> tuple[str | None, str]:
     """Find *backend*'s own executable and the PATH searched for it.
 
     Three rungs, the plain-binary ladder: explicit override, then mise, then the
@@ -1009,15 +1034,21 @@ def _resolve_self_served_bin(backend: str) -> tuple[str | None, str]:
     script -- which is exactly what membership in ``ACP_BACKEND_LAUNCH`` asserts.
 
     The binary name and the override variable come from that record, so a harness is
-    resolved by its row rather than by a function of its own.
+    resolved by its row rather than by a function of its own. A caller that already
+    HOLDS the record passes it as *launch*, and this resolves that record rather than
+    re-reading the table: the table's row for the operator-named harness is rewritten
+    at config load, so a re-read from inside a worker thread could answer for a
+    record the caller never saw -- one harness's binary paired with another's args.
+    Omitted, the current row is read, which is what the install probe wants.
 
     Returns ``(None, search_path)`` when it is absent, so the caller reports what was
     searched rather than raising from inside the resolver.
     """
-    launch = launch_for(backend)
+    if launch is None:
+        launch = launch_for(backend)
     search_path = augmented_path(os.environ.get("PATH", ""))
 
-    override = os.environ.get(launch.bin_env_var)
+    override = os.environ.get(launch.bin_env_var) if launch.bin_env_var else None
     if override and platform_compat.is_executable_file(override):
         return _normalize_exe_casing(override) or override, search_path
 
@@ -4853,6 +4884,26 @@ class AcpClient:
         # of denied calls, which must never reach ``completed``.
         self._pi_gate_request_tool: dict[str, str] = {}
         self._pi_gate_denied_ids: set[str] = set()
+        # The custom harness's in-band check, same shape as the pi gate's but keyed
+        # on plain ``session/request_permission`` frames rather than a nonce'd
+        # envelope: the operator ATTESTED that the configured option makes the
+        # harness ask, and these three sets are how that attestation is observed
+        # rather than trusted. Passive ids are calls whose ``tool_call`` frame
+        # declared a kind ACP does not make a harness ask about (read/search/think),
+        # tolerated the way every SESSION_CONFIG harness's passive reads are and
+        # compensated by the same OS credential mask. See ``_tripwire_custom_gate``.
+        self._custom_gate_asked_ids: set[str] = set()
+        self._custom_gate_request_tool: dict[str, str] = {}
+        self._custom_gate_denied_ids: set[str] = set()
+        self._custom_gate_passive_ids: set[str] = set()
+        # The custom harness's ``(gate_option, gate_value)`` as it stood when THIS
+        # process was spawned. ``_initialize_session`` arms the gate from this copy,
+        # never from the live table: a config reload can unregister the harness
+        # between spawn and ``session/new``, and a table read at that moment answers
+        # "no routing declared" for a process that is already running -- which would
+        # skip the arm and let the first prompt run ungated. ``None`` until the
+        # custom spawn arm takes the copy; a custom session with no copy is refused.
+        self._custom_gate_snapshot: tuple[str, str] | None = None
         self._session_key = session_key
         # When set, this client emits a per-tool-call SEL audit from the ACP
         # dispatch loop. Used by app/worker-pool clients (e.g. code-review-sage,
@@ -5161,6 +5212,10 @@ class AcpClient:
     @property
     def _is_deepseek(self) -> bool:
         return self.backend == ACP_BACKEND_DEEPSEEK
+
+    @property
+    def _is_custom(self) -> bool:
+        return self.backend == ACP_BACKEND_CUSTOM
 
     @property
     def _model_registry_namespace(self) -> str:
@@ -7044,7 +7099,9 @@ class AcpClient:
 
     # ── Dynamic Config from ACP ──
 
-    async def _apply_session_permission_routing(self) -> None:
+    async def _apply_session_permission_routing(
+        self, *, gate: tuple[str, str] | None = None
+    ) -> None:
         """Make a SESSION_CONFIG harness actually ask, or refuse to run it.
 
         Called ONLY for a ``SESSION_CONFIG`` harness -- the caller tests that, so
@@ -7059,20 +7116,49 @@ class AcpClient:
 
         Only the enforced mechanisms refuse; ``enforce_runtime_routing`` owns that
         decision, so the scope lives in one place instead of being re-derived here.
+
+        *gate* is the pair to arm when the caller holds one that must NOT be
+        re-read from the tables -- the custom harness's spawn-time snapshot. With
+        it set, every question here is answered from the pair, and a failure
+        refuses outright: the snapshot exists because the table may not name this
+        harness by the time this runs, and a table-keyed enforcement check would then
+        answer "not enforced" for a harness that was registered as enforced and
+        nothing else.
         """
         backend = self.backend
-        option_id, value = acp_tool_gate.permission_config_for(backend)
-        issue = acp_tool_gate.session_config_issue(backend, self._acp_config_options)
+        if gate is not None:
+            option_id, value = gate
+            issue = acp_tool_gate.config_option_issue(option_id, value, self._acp_config_options)
+            remedy = (
+                f"Correct agent.custom_acp.gate_option/gate_value ({option_id}={value}) to an "
+                "option this harness advertises on session/new."
+            )
+        else:
+            option_id, value = acp_tool_gate.permission_config_for(backend)
+            issue = acp_tool_gate.session_config_issue(backend, self._acp_config_options)
+            remedy = acp_tool_gate.remediation_for(backend)
+
+        def _refuse(reason: str) -> AcpToolGateUnroutable:
+            # The snapshot path's refusal, worded as ``enforce_runtime_routing``
+            # words its own so the operator reads one message shape.
+            return AcpToolGateUnroutable(
+                f"{acp_tool_gate.label_for(backend)} tool calls would not reach Kiro Crew's "
+                f"security gate ({reason}), so {acp_tool_gate.UNENFORCED_CONTROLS} would not "
+                f"be consulted for them. {remedy}"
+            )
+
         if issue:
             # Not advertised: INDETERMINATE, never BYPASSED. The adapter may well
             # ask anyway; Kiro Crew simply has no evidence, and the enforcement
             # treats the two identically while the message stays honest.
+            if gate is not None:
+                raise _refuse(issue)
             try:
                 acp_tool_gate.enforce_runtime_routing(
                     backend,
                     issue,
                     verdict=acp_tool_gate.Verdict.INDETERMINATE,
-                    remedy=acp_tool_gate.remediation_for(backend),
+                    remedy=remedy,
                 )
             except acp_tool_gate.ToolGateUnroutable as exc:
                 raise AcpToolGateUnroutable(str(exc)) from None
@@ -7083,12 +7169,15 @@ class AcpClient:
         except AcpError as exc:
             # The option was advertised and the write still failed, so this is an
             # observed bypass rather than missing evidence.
+            rejected = "the adapter rejected its required session permission configuration"
+            if gate is not None:
+                raise _refuse(rejected) from exc
             try:
                 acp_tool_gate.enforce_runtime_routing(
                     backend,
-                    "the adapter rejected its required session permission configuration",
+                    rejected,
                     verdict=acp_tool_gate.Verdict.BYPASSED,
-                    remedy=acp_tool_gate.remediation_for(backend),
+                    remedy=remedy,
                 )
             except acp_tool_gate.ToolGateUnroutable as gate_exc:
                 raise AcpToolGateUnroutable(str(gate_exc)) from exc
@@ -7329,7 +7418,9 @@ class AcpClient:
             self._discard_sandbox_cleanup()
             raise
 
-    async def _resolve_self_served_launch(self) -> tuple[str, list[str], str, str]:
+    async def _resolve_self_served_launch(
+        self, launch: "SelfServedLaunch | None" = None
+    ) -> tuple[str, list[str], str, str]:
         """The binary, argv, spawn label and stderr label for a self-served harness.
 
         ONE resolution for every member of ``ACP_BACKEND_LAUNCH``, because for those
@@ -7337,6 +7428,11 @@ class AcpClient:
         serves ACP, the args that follow it, and the two labels derived from the same
         pair. A harness whose argv needs a decision is not a member and does not call
         this.
+
+        *launch* is the record to resolve when the caller already holds one it
+        captured together with other facts that must describe the SAME registration
+        -- the custom arm's spec snapshot. ``None`` reads the table here, on the
+        loop, which is atomic enough for every harness whose row never changes.
 
         Off-loop, like the per-harness resolutions it replaces: the ladder reads the
         environment and stats candidate paths. Cached per backend for the gateway's
@@ -7347,12 +7443,38 @@ class AcpClient:
         adds no step and no conditional to their construction paths (harness-parity
         H13).
         """
-        launch = launch_for(self.backend)
+        if launch is None:
+            try:
+                launch = launch_for(self.backend)
+            except KeyError:
+                # Reachable for exactly one harness: the operator-named one, whose row
+                # is written and withdrawn at config load. A reload that removed the
+                # block between two spawn attempts (the retry after an init failure
+                # reads config) lands here, and the reader deserves the reason, not a
+                # KeyError.
+                raise AcpError(
+                    f"{acp_tool_gate.label_for(self.backend)} is not configured: "
+                    "agent.custom_acp was cleared or made incomplete while this "
+                    "session was starting. Fill it in again, or pick another agent."
+                ) from None
+        # A cached answer is only good for the record that produced it. The record
+        # changes for exactly one harness -- the operator-named one, rewritten at
+        # config load -- and when it has, the old resolution is dropped HERE, on the
+        # loop and before any await, so the spawn below resolves the new command.
+        # Bumping the generation fences a resolve of the OLD record still in flight,
+        # exactly as a re-check does. No-op for a record that has not changed.
+        resolved_for = _self_served_bin_cache_records.get(self.backend)
+        if resolved_for is not None and resolved_for != launch:
+            _self_served_bin_caches.pop(self.backend, None)
+            bump_resolution_generation(self.backend)
         if self.backend in _self_served_bin_caches:
             binary, search_path = _self_served_bin_caches[self.backend]
         else:
             epoch = _resolution_epoch(self.backend)
-            resolved = await asyncio.to_thread(_resolve_self_served_bin, self.backend)
+            # The record captured above rides into the worker: the resolver must not
+            # re-read the table there, where a config reload landing mid-resolve
+            # would hand it the NEXT record's binary to pair with THIS record's args.
+            resolved = await asyncio.to_thread(_resolve_self_served_bin, self.backend, launch)
             # Publish only under the generation this resolve started in. A clear that
             # landed while it ran means the answer predates an install, so writing it
             # would undo the clear -- see ``_resolution_generation``. This session still
@@ -7361,13 +7483,16 @@ class AcpClient:
             # concurrent pop from raising ``KeyError`` here.
             if _resolution_epoch(self.backend) == epoch:
                 _self_served_bin_caches[self.backend] = resolved
+                _self_served_bin_cache_records[self.backend] = launch
             binary, search_path = resolved
         if not binary:
+            override_hint = (
+                f", or set {launch.bin_env_var} to the executable" if launch.bin_env_var else ""
+            )
             raise AcpError(
                 f"{launch.binary} not found "
                 f"({describe_search_path(search_path)}). Install it with "
-                f"'{launch.install_command}', or set {launch.bin_env_var} to the "
-                f"executable. {launch.missing_hint}"
+                f"'{launch.install_command}'{override_hint}. {launch.missing_hint}"
             )
         return binary, [binary, *launch.acp_args], launch.spawn_label, launch.binary
 
@@ -7685,6 +7810,59 @@ class AcpClient:
                     )
                 except acp_tool_gate.ToolGateUnroutable as exc:
                     raise AcpToolGateUnroutable(str(exc)) from None
+        elif self._is_custom:
+            # The operator-named harness: its binary, args and gate pair are whatever
+            # ``agent.custom_acp`` says. ONE read of the registered spec -- a frozen
+            # object config load publishes whole -- supplies both the launch record
+            # and the pair, so the two cannot come from different registrations: no
+            # await sits between reading them, and a reload that lands during the
+            # resolution below rewrites the tables, not this snapshot.
+            # ``_initialize_session`` arms the gate from the snapshot; a reload that
+            # unregisters the harness after this line cannot turn the arm into a
+            # skipped step (see ``_custom_gate_snapshot``). No spec means the reload
+            # already happened: refuse with the record named, rather than run a
+            # harness whose registration is gone.
+            custom_spec = custom_backend_spec()
+            if custom_spec is None:
+                raise AcpError(
+                    f"{acp_tool_gate.label_for(self.backend)} was withdrawn while starting: "
+                    "agent.custom_acp was cleared or made incomplete, so this session is "
+                    "refused rather than run with no gate to arm."
+                )
+            self._custom_gate_snapshot = (
+                custom_spec.gate_option.strip(),
+                custom_spec.gate_value.strip(),
+            )
+            _custom_bin, argv, spawn_label, stderr_label = await self._resolve_self_served_launch(
+                custom_spec.launch()
+            )
+            # No spec translation is warmed, and the array this session sends carries
+            # only the shared broker append: this id has no mirror and is outside
+            # ``ACP_BACKENDS_SESSION_MCP_ARRAY``, because nothing is measured about
+            # how an arbitrary harness treats the array. ``providers/mirrors/registry``
+            # declares that as a no-channel projection so the card says so.
+            #
+            # The refuse-then-mask preflight, keyed on the routing question rather
+            # than on identity, exactly as the opencode arm keys it: this harness is
+            # ENFORCED -- config load registers it as ``SESSION_CONFIG`` and nothing
+            # else -- so the OS credential mask is the compensating control for the
+            # passive reads ACP v1 cannot make it ask about, and
+            # ``test_every_enforced_harness_reaches_the_spawn_preflight`` counts this
+            # call. Nothing is spared from the mask: the auth declaration for this id
+            # puts no leaf on the floor, so ``adapter_expose`` resolves to the host's
+            # own re-exposures alone.
+            #
+            # No routing seed and no read-back HERE, because this harness's gate is
+            # not a setting Crew supplies: it is a ``configOptions`` entry the harness
+            # advertises on ``session/new``, verified and applied by
+            # ``_apply_session_permission_routing`` in ``_initialize_session`` after
+            # the session exists and before the first prompt -- the same site codex
+            # uses. A harness that does not advertise the configured option is
+            # refused there with the option named.
+            adapter_hidden_dirs = await _run_preflight_bounded(
+                _sandbox_preflight, self.backend, self._sandbox_mode
+            )
+            adapter_expose = acp_tool_gate.adapter_expose_files(self.backend, adapter_hidden_dirs)
         elif self._is_deepseek:
             # This harness is a plugin host and ACP is one of the profiles it boots,
             # so the argv is its own binary plus the profile selector: no adapter
@@ -9062,7 +9240,20 @@ class AcpClient:
         #    Gated HERE rather than inside the method, so the first-class Kiro path
         #    gains no call, no await and no failure point in service of an adapter
         #    (harness-parity H13). A positive membership test, never "not claude".
-        if acp_tool_gate.routing_for(self.backend) is acp_tool_gate.Routing.SESSION_CONFIG:
+        if self._is_custom:
+            # The operator-named harness arms from the pair its spawn arm copied,
+            # never from the table: a reload can have unregistered it since, and a
+            # table read here would then answer "not SESSION_CONFIG" and skip the
+            # arm for a process that is running. No copy means the spawn arm did not
+            # run for this process, and that is a refusal, not a fall-through.
+            if self._custom_gate_snapshot is None:
+                raise AcpToolGateUnroutable(
+                    f"{acp_tool_gate.label_for(self.backend)} has no permission option on "
+                    "record for this process, so its tool calls would not reach Kiro Crew's "
+                    "security gate; the session is refused."
+                )
+            await self._apply_session_permission_routing(gate=self._custom_gate_snapshot)
+        elif acp_tool_gate.routing_for(self.backend) is acp_tool_gate.Routing.SESSION_CONFIG:
             await self._apply_session_permission_routing()
 
         # (settings.local.json is re-seeded up in step 2/3, beside the model-cache
@@ -10249,6 +10440,7 @@ class AcpClient:
                     # The gate tripwire holds on every reader that answers
                     # permission frames, this text-only one included.
                     await self._tripwire_pi_gate(msg)
+                    await self._tripwire_custom_gate(msg)
                     await self._tripwire_goose_mode(msg)
                     chunk, is_thinking = self._extract_text_chunk(msg)
                     if chunk and not is_thinking:
@@ -10426,6 +10618,7 @@ class AcpClient:
                 _raise_acp_error(msg.error, self._advertised_model_ids(), backend=self.backend)
             if action == "permission":
                 permission_event = self._build_permission_event(msg)
+                await self._enforce_custom_gate_bound()
                 # Two refusals before the consumer's gate sees the request: a switched-off
                 # tool, and a harness identity that is absent or names an unmounted
                 # server. The second matters HERE as much as on the auto-approve site --
@@ -10520,6 +10713,7 @@ class AcpClient:
                 # message end.  See `_extract_tool_call_update` for the dual-path
                 # (content blocks vs rawOutput) details.
                 await self._tripwire_pi_gate(msg)
+                await self._tripwire_custom_gate(msg)
                 await self._tripwire_goose_mode(msg)
                 tool_result_event = self._extract_tool_call_update(msg)
                 if tool_result_event:
@@ -10744,6 +10938,7 @@ class AcpClient:
         # An approved call may complete; forget the envelope mapping so the map
         # stays bounded by the calls still awaiting an answer.
         getattr(self, "_pi_gate_request_tool", {}).pop(str(request_id), None)
+        getattr(self, "_custom_gate_request_tool", {}).pop(str(request_id), None)
         resolved_id = option_id
         if resolved_id is None:
             recorded = self._permission_options.pop(request_id, None)
@@ -10769,6 +10964,41 @@ class AcpClient:
         tool_call_id = getattr(self, "_pi_gate_request_tool", {}).pop(str(request_id), None)
         if tool_call_id:
             self._pi_gate_denied_ids.add(tool_call_id)
+        self._note_custom_gate_denied(request_id)
+
+    def _note_custom_gate_asked(self, msg: JsonRpcMessage) -> None:
+        """Remember the tool call a custom harness's permission frame is asking about.
+
+        The plain ACP shape -- ``params.toolCall.toolCallId`` -- because the custom
+        harness runs no Crew extension and mints no nonce; the frame IS the
+        evidence that this call reached the gate. Runs on every path that answers a
+        permission frame, like :meth:`_note_pi_gate_asked`, and is a no-op on every
+        other backend.
+        """
+        if not getattr(self, "_is_custom", False):
+            return
+        params = msg.params if isinstance(msg.params, dict) else {}
+        tool_call = params.get("toolCall")
+        tool_call_id = tool_call.get("toolCallId") if isinstance(tool_call, dict) else None
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            return
+        asked = getattr(self, "_custom_gate_asked_ids", None)
+        if asked is None:
+            return
+        asked.add(tool_call_id)
+        if msg.id is not None:
+            self._custom_gate_request_tool[str(msg.id)] = tool_call_id
+
+    def _note_custom_gate_denied(self, request_id: str | int) -> None:
+        """Remember that the host DENIED a custom harness's permission request.
+
+        A denied call that later reports ``completed`` is a harness that asked and
+        then did not honour the answer -- the operator's option made it ask, not
+        obey -- and trips :meth:`_tripwire_custom_gate` like an unasked call does.
+        """
+        tool_call_id = getattr(self, "_custom_gate_request_tool", {}).pop(str(request_id), None)
+        if tool_call_id:
+            self._custom_gate_denied_ids.add(tool_call_id)
 
     async def reject_tool(self, request_id: str | int) -> None:
         """Reject a pending session/request_permission.
@@ -11108,6 +11338,7 @@ class AcpClient:
                     await self._maybe_note_skill_read(tool_event)
                     await self._maybe_fire_pre_tool_hooks(tool_event)
                 await self._tripwire_pi_gate(msg)
+                await self._tripwire_custom_gate(msg)
                 await self._tripwire_goose_mode(msg)
                 tool_result_event = self._extract_tool_call_update(msg)
                 if tool_result_event:
@@ -11141,6 +11372,8 @@ class AcpClient:
         # Before the branch: on a session that judges nothing no event is built here,
         # and the gate tripwire still needs to know this call was asked about.
         self._note_pi_gate_asked(msg)
+        self._note_custom_gate_asked(msg)
+        await self._enforce_custom_gate_bound()
         if self._judges_permission_requests:
             event = self._build_permission_event(msg)
             if await self._deny_spec_disabled_tool(event):
@@ -11508,6 +11741,181 @@ class AcpClient:
             "stopped. Start a new chat, and if it recurs check the pi-acp and pi versions: "
             "the adapter must run the command named by PI_ACP_PI_COMMAND and forward "
             "extension dialogs, and pi must honour an extension's block."
+        )
+
+    #: ACP tool kinds a SESSION_CONFIG harness is not made to ask about. The gate's
+    #: own model already accepts this for codex -- passive reads bypass the gate and
+    #: the OS credential mask compensates -- and the custom harness carries that mask
+    #: too, so the tripwire below holds it to the same line rather than a stricter
+    #: one. ``fetch`` is deliberately absent: it acts on the network, which the gate's
+    #: egress scope exists to see.
+    _CUSTOM_GATE_PASSIVE_KINDS: frozenset = frozenset({"read", "search", "think"})
+    # The ``tool_call_update`` statuses after which a call id is never heard of again.
+    _CUSTOM_GATE_TERMINAL_STATUSES: frozenset = frozenset({"completed", "failed", "cancelled"})
+    #: The most call ids the four tracking collections may hold between them. A
+    #: terminal status releases an id, so the count is the number of calls IN FLIGHT
+    #: at once, and no honest harness has hundreds of tool calls open: a count past
+    #: this is a harness minting ids it never finishes, and the bound is what keeps
+    #: that from growing the gateway's memory without limit. Checked by
+    #: :meth:`_enforce_custom_gate_bound` on every frame that can add an id.
+    _CUSTOM_GATE_MAX_INFLIGHT: int = 512
+
+    def _custom_gate_tracked(self) -> int:
+        """How many call ids the custom-gate tracking collections hold right now."""
+        return (
+            len(getattr(self, "_custom_gate_asked_ids", ()))
+            + len(getattr(self, "_custom_gate_denied_ids", ()))
+            + len(getattr(self, "_custom_gate_passive_ids", ()))
+            + len(getattr(self, "_custom_gate_request_tool", ()))
+        )
+
+    async def _enforce_custom_gate_bound(self) -> None:
+        """Stop a custom harness whose in-flight calls exceed ``_CUSTOM_GATE_MAX_INFLIGHT``.
+
+        Runs after every frame that can add an id -- a ``tool_call`` frame, a
+        permission request -- so the collections are never more than one frame past
+        the bound. No-op on every other backend and under the bound.
+        """
+        if not getattr(self, "_is_custom", False):
+            return
+        tracked = self._custom_gate_tracked()
+        if tracked <= self._CUSTOM_GATE_MAX_INFLIGHT:
+            return
+        logger.error(
+            "custom gate: %d tool calls in flight exceeds the bound of %d; the harness is "
+            "being stopped [session=%s]",
+            tracked,
+            self._CUSTOM_GATE_MAX_INFLIGHT,
+            self._session_id,
+        )
+        try:
+            sel_module.sel().log_tool_invocation(
+                session_key=self._session_key or "",
+                source="acp",
+                tool_name="custom_gate_bound",
+                tool_kind="other",
+                outcome="inflight_bound_exceeded",
+                metadata={
+                    "reason": "custom_gate_bound",
+                    "backend": self.backend,
+                    "tracked": tracked,
+                    "bound": self._CUSTOM_GATE_MAX_INFLIGHT,
+                },
+            )
+        except Exception:  # pragma: no cover - audit is best-effort
+            logger.debug("custom gate: audit of the bound failed", exc_info=True)
+        await self._kill_process(force=True)
+        raise AcpToolGateUnroutable(
+            f"{acp_tool_gate.label_for(self.backend)} left {tracked} tool calls open at "
+            f"once, more than the {self._CUSTOM_GATE_MAX_INFLIGHT} Kiro Crew tracks; a "
+            "harness that starts calls it never finishes cannot be followed, so it was "
+            "stopped."
+        )
+
+    def _note_custom_gate_kind(self, tool_call_id: object, kind: object) -> None:
+        """Record whether a custom harness's call declared itself passive.
+
+        Read off the ``tool_call`` frame and any refinement that carries a ``kind``.
+        A passive declaration ADDS the id; a later non-passive declaration for the
+        same id REMOVES it, so the stricter word wins and a harness cannot downgrade
+        a call after the fact. A missing kind records nothing: an undeclared call is
+        held to asking, which is the fail-closed reading of "unknown".
+        """
+        if not getattr(self, "_is_custom", False):
+            return
+        if not isinstance(tool_call_id, str) or not tool_call_id or not isinstance(kind, str):
+            return
+        passive = getattr(self, "_custom_gate_passive_ids", None)
+        if passive is None:
+            return
+        if kind in self._CUSTOM_GATE_PASSIVE_KINDS:
+            passive.add(tool_call_id)
+        else:
+            passive.discard(tool_call_id)
+
+    async def _tripwire_custom_gate(self, msg: JsonRpcMessage) -> None:
+        """Refuse to continue a custom-harness session that acted without asking.
+
+        The operator's ``gate_option``/``gate_value`` is an ATTESTATION that the
+        option makes the harness raise ``session/request_permission`` before it acts;
+        ``session_config_issue`` verifies the option is advertised and the apply
+        verifies it is accepted, and neither can verify what it means. This is the
+        in-band check that does not depend on the attestation: a ``tool_call_update``
+        reaching ``completed`` for a call no permission frame asked about -- unless
+        its own ``tool_call`` frame declared a passive kind -- is a call that ran with
+        none of Crew's controls consulted, and a completed call the host DENIED is a
+        harness that asked and did not obey. Either way the call has already run, so
+        this cannot undo it; what it can do is make it the LAST one, and say why in
+        terms the operator can act on: the option they named does not do what they
+        said. No-op on every other backend.
+        """
+        if not getattr(self, "_is_custom", False):
+            return
+        # Before the terminal-status filter: the ``tool_call`` frame that added an id
+        # is not a ``tool_call_update`` and would otherwise return below unchecked.
+        await self._enforce_custom_gate_bound()
+        params = msg.params if isinstance(msg.params, dict) else {}
+        update = params.get("update")
+        if not isinstance(update, dict) or update.get("sessionUpdate") != "tool_call_update":
+            return
+        status = update.get("status")
+        if status not in self._CUSTOM_GATE_TERMINAL_STATUSES:
+            return
+        tool_call_id = update.get("toolCallId")
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            return
+        asked: set[str] = getattr(self, "_custom_gate_asked_ids", set())
+        denied: set[str] = getattr(self, "_custom_gate_denied_ids", set())
+        passive: set[str] = getattr(self, "_custom_gate_passive_ids", set())
+        # A terminal status is the last word on this id, so it leaves every tracking
+        # set here: the sets then hold only the calls still in flight, and a long
+        # session cannot grow them by one entry per call the harness ever made.
+        was_denied = tool_call_id in denied
+        was_gated = tool_call_id in asked or tool_call_id in passive
+        asked.discard(tool_call_id)
+        denied.discard(tool_call_id)
+        passive.discard(tool_call_id)
+        if status != "completed":
+            return
+        if was_denied:
+            outcome, what = "ran_despite_deny", "after Kiro Crew's gate DENIED it"
+        elif not was_gated:
+            outcome, what = "ran_without_gate", "without asking Kiro Crew's gate"
+        else:
+            return
+        # The pair this process was armed with, so the message names what this
+        # session actually applied even if config has since named another.
+        option_id, value = self._custom_gate_snapshot or acp_tool_gate.permission_config_for(
+            self.backend
+        )
+        logger.error(
+            "custom gate: tool call %s COMPLETED %s; the configured option %s=%s does not "
+            "make this harness ask before it acts, so the harness is being stopped "
+            "[session=%s]",
+            tool_call_id,
+            what,
+            option_id,
+            value,
+            self._session_id,
+        )
+        try:
+            sel_module.sel().log_tool_invocation(
+                session_key=self._session_key or "",
+                source="acp",
+                tool_name=tool_call_id,
+                tool_kind="other",
+                outcome=outcome,
+                metadata={"reason": "custom_gate_tripwire", "backend": self.backend},
+            )
+        except Exception:  # pragma: no cover - audit is best-effort
+            logger.debug("custom gate: audit of the tripwire failed", exc_info=True)
+        await self._kill_process(force=True)
+        raise AcpToolGateUnroutable(
+            f"{acp_tool_gate.label_for(self.backend)} ran tool call {tool_call_id} {what}. "
+            f"agent.custom_acp names {option_id}={value} as the option that makes this "
+            "harness ask before it acts, and this call shows it does not; the harness was "
+            "stopped. Correct gate_option/gate_value to an option that makes every "
+            "action ask, or name a harness that has one."
         )
 
     def _audit_spec_restriction(self, *, tool_name: str, outcome: str, reason: str) -> None:
@@ -11995,6 +12403,7 @@ class AcpClient:
             # kind + adapter-authored MCP markers, never the kind alone (see
             # _dispatch.classify_tool_call).
             identity = classify_tool_call(update)
+            self._note_custom_gate_kind(tool_call_id, kind)
             note_tool_call_started(
                 tool_call_id,
                 kind=kind,
@@ -12272,6 +12681,7 @@ class AcpClient:
         title = update.get("title")
         kind = update.get("kind")
         raw_input = update.get("rawInput")
+        self._note_custom_gate_kind(tool_use_id, kind)
         # Only emit when at least one refinement field is present. Pure-output
         # updates (content/rawOutput only) are handled by the result extractor.
         if title is None and kind is None and not raw_input:
@@ -12488,6 +12898,7 @@ class AcpClient:
         if recorded is not None:
             self._permission_options[event.request_id] = recorded
         self._note_pi_gate_asked(msg)
+        self._note_custom_gate_asked(msg)
         logger.info("Permission requested for tool: %s (req=%s)", event.title, event.request_id)
         if logger.isEnabledFor(logging.DEBUG):
             params = msg.params if isinstance(msg.params, dict) else {}

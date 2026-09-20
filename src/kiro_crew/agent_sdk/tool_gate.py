@@ -62,8 +62,10 @@ from kiro_crew import platform_compat
 from kiro_crew.agent_sdk import host_auth
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_CUSTOM,
     ACP_BACKEND_LAUNCH,
     ACP_BACKEND_PI,
+    CUSTOM_ACP_LABEL,
     Routing,
     gate_probe_command_for,
     permission_config_for,
@@ -122,6 +124,10 @@ UNENFORCED_CONTROLS = (
 _LABELS: dict = {
     ACP_BACKEND_CODEX: "OpenAI Codex",
     ACP_BACKEND_PI: "Pi",
+    # custom keeps a row here too, though its launch record carries the same label:
+    # that record exists only while a spec is configured, and a refusal about an
+    # UNCONFIGURED custom -- "not selectable" -- still has to name it.
+    ACP_BACKEND_CUSTOM: CUSTOM_ACP_LABEL,
     **{backend: record.label for backend, record in sorted(ACP_BACKEND_LAUNCH.items())},
 }
 
@@ -510,6 +516,22 @@ def routing_verdict(backend: str) -> tuple:
         # after session/new and before the first prompt. Port this verdict without
         # that caller and the harness reports routed while running its own default
         # mode -- the one silent-bypass hole in this design.
+        if backend == ACP_BACKEND_CUSTOM:
+            # Same mechanism, different PROVENANCE, and the reason says so. For a
+            # shipped harness the pair in ``ACP_BACKEND_PERMISSION_CONFIG`` was chosen
+            # by this repo after reading what the option DOES; for the custom harness
+            # the operator chose it in ``agent.custom_acp``. What Crew verifies is the
+            # same in both cases -- the option is advertised, the value is accepted --
+            # and what it cannot verify for an arbitrary harness is that the value
+            # MEANS "ask before acting". That part is the operator's attestation, and
+            # a verdict that hid the difference would be claiming a check nobody ran.
+            return (
+                Verdict.ROUTED,
+                f"the client enforces {option_id}={value} before the first prompt; that "
+                f"this option makes the harness ask is the operator's attestation in "
+                f"agent.custom_acp, not something Kiro Crew verified; a call the harness "
+                f"labels passive, or never reports, is seen only by the sandbox mask",
+            )
         return (
             Verdict.ROUTED,
             f"the client enforces {option_id}={value} before the first prompt",
@@ -606,6 +628,16 @@ def remediation_for(backend: str) -> str:
     if routing is Routing.SESSION_CONFIG:
         option_id, value = permission_config_for(backend)
         if option_id and value:
+            if backend == ACP_BACKEND_CUSTOM:
+                # There is no adapter to install: the harness is whatever the operator
+                # named, so the only actionable change is to the spec itself.
+                return (
+                    f"{label_for(backend)}: the harness named in agent.custom_acp did not "
+                    f"advertise ACP session config option {option_id!r} with value "
+                    f"{value!r} on session/new. Correct gate_option/gate_value to an option "
+                    f"that harness advertises and that makes it ask before acting, or name "
+                    f"a harness that has one."
+                )
             return (
                 f"Install a {label_for(backend)} adapter that advertises ACP session "
                 f"config option {option_id!r} with value {value!r}."
@@ -639,6 +671,20 @@ def session_config_issue(backend: str, config_options: object) -> str:
     if routing_for(backend) is not Routing.SESSION_CONFIG:
         return ""
     option_id, required = permission_config_for(backend)
+    return config_option_issue(option_id, required, config_options)
+
+
+def config_option_issue(option_id: str, required: str, config_options: object) -> str:
+    """Why the ``(option_id, required)`` pair cannot be applied to this session.
+
+    The table-free half of :func:`session_config_issue`: it judges a pair the
+    caller already holds against what ``session/new`` advertised, and reads no
+    registry. That is what a client needs for a gate it SNAPSHOTTED at spawn --
+    the operator-named harness's pair can be unregistered by a config reload
+    while its session is starting, and a check that re-read the table at that
+    moment would answer "no routing declared" for a harness that is running.
+    ``""`` means the exact option AND value were advertised.
+    """
     if not option_id or not required:
         return "the harness declares session-config routing but names no config option"
     if not isinstance(config_options, list):
@@ -795,6 +841,7 @@ __all__ = [
     "Verdict",
     "adapter_expose_files",
     "adapter_hidden_credential_dirs",
+    "config_option_issue",
     "enforce_runtime_routing",
     "enforce_sandbox_floor",
     "gate_extension_issue",

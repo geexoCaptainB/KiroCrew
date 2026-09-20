@@ -82,7 +82,16 @@ export const CHUNK_BUDGETS = {
   // lazy import() boundary can move a catalog string out of `all`, which is why
   // shrinking is not an option here. Back to the 5% convention over the
   // measurement that includes this branch (11,930,130 B).
-  all: 12240 * KB, // measured 11650.5 KB on fix/gatewayd-overload-liveness 2026-09-16 (5.1% headroom)
+  // Re-measured 2026-09-20: main @ 8169d3cf2 alone builds the chunk at
+  // 12,498,868 B (12205.9 KB) against the 12240 KB ceiling -- 34.1 KB left, or
+  // 0.28% headroom, so it fails on the next PR's ordinary strings. Attribution
+  // measured, not assumed: this branch adds the Custom ACP form's copy (intro,
+  // four field labels and helps, attestation, save/remove/status lines) x 13
+  // languages, 40,539 B (39.6 KB), and no module -- the chunk still holds the
+  // same 13 catalogs plus the entry, and no lazy import() boundary can move a
+  // catalog string out of `all`. Back to the 5% convention over the measurement
+  // that includes this branch (12,539,407 B).
+  all: 12860 * KB, // measured 12245.5 KB on feat/custom-acp-provider 2026-09-20 (5.0% headroom)
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
   // named after `src/i18n/t.ts`. Held separately from `all` above because
