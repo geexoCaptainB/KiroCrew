@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import threading
+import weakref
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -150,7 +152,7 @@ async def test_failed_owner_cleanup_survives_gc_and_retries_from_maintenance(
     )
     process = process_type()
     owner = SimpleNamespace(process=process)
-    owner_ref = __import__("weakref").ref(process)
+    owner_ref = weakref.ref(process)
     monkeypatch.setattr(pc, "duplicate_asyncio_process_handle", lambda _: 1000)
     monkeypatch.setattr(session_pid, "config_dir", lambda: tmp_path)
 
@@ -170,14 +172,16 @@ async def test_failed_owner_cleanup_survives_gc_and_retries_from_maintenance(
         await pc.terminate_windows_asyncio_tree(owner.process)
     except OSError as exc:
         assert "temporary descendant discovery refusal" in str(exc)
+        # Break the refusal cycle before sampling ownership. The traceback's drain
+        # frame closes over the process, so clearing it makes collection exact.
+        exc.__traceback__ = None
     else:
         pytest.fail("temporary descendant discovery refusal was treated as success")
     assert session_pid.cleanup_orphaned_session_roots() == 0
 
     owner.process = None
     del process
-    await asyncio.sleep(0)
-    __import__("gc").collect()
+    gc.collect()
     assert owner_ref() is None, "pending cleanup retained the process owner graph"
     assert retained_seen[1] == {100, 200}, "retry lost the pinned intermediary"
     assert kernel.closed == [], "failed retries released exact cleanup authority"
