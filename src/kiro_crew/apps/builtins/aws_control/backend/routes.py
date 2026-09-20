@@ -37,6 +37,7 @@ MUTATIONS (also restricted-session refused + SEL-audited)
 ``POST /backup/{account}/run``                 run a backup (snapshot | sessions)
 ``POST /backup/{account}/nightly``             toggle the nightly snapshot
 ``POST /backup/{account}/retention``           set or clear the retention count
+``POST /backup/{account}/nightly-sessions``    toggle the nightly sessions archive
 ``POST /backup/{account}/restore``             download an archive to the staging dir
 ``POST /install/label``                        rename THIS install (display only, local)
 
@@ -2300,6 +2301,29 @@ async def _handle_backup_status(request: web.Request) -> web.Response:
         # `null` when retention is off. A panel reporting a number the sweep would
         # clamp or ignore is worse than reporting none.
         "retentionKeep": await asyncio.to_thread(backup_mod.retention_keep, account),
+        # Reported as its own field, never folded into `nightly`. The console
+        # renders two switches because there are two grants, and a single field
+        # would make the page unable to show that transcripts are still off.
+        "nightlySessions": await asyncio.to_thread(backup_mod.nightly_sessions_enabled, account),
+        # Why that grant cannot actually run, or None when it can. Reported
+        # BESIDE the grant rather than folded into it, because the two answer
+        # different questions: the grant is what the owner asked for and must
+        # keep reading back as they set it, while this says whether asking for it
+        # achieves anything here. Without it the console can only show the
+        # switch as on, which on a host that cannot produce the archive is a
+        # claim that transcripts are being backed up when none ever are -- and
+        # the loss only surfaces on the host-loss event the feature exists for.
+        #
+        # ``scheduled_account`` is the part only this route can answer. The grant
+        # is settable on any account in the registry while the nightly loop runs
+        # for the one the default key belongs to, so a grant recorded on a second
+        # account is authorized and unreachable at the same time. Answering it
+        # here turns that into a sentence under the switch instead of a schedule
+        # the operator believes in and nothing ever honours.
+        "nightlySessionsBlocked": await asyncio.to_thread(
+            backup_mod.scheduled_sessions_blocked_code,
+            scheduled_account=account == await accounts_mod.default_account_id(),
+        ),
         "runs": await asyncio.to_thread(backup_mod.last_runs, account),
         "jobs": await asyncio.to_thread(_account_jobs, account),
         # This install's own identity, so every row can be told from every other
@@ -2415,7 +2439,20 @@ async def _handle_backup_run(request: web.Request) -> web.Response:
     return web.json_response({"started": True, "kind": kind, "runId": run_id})
 
 
-async def _handle_backup_nightly(request: web.Request) -> web.Response:
+async def _toggle_nightly(
+    request: web.Request,
+    *,
+    setter: Any,
+    field: str,
+    what: str,
+) -> web.Response:
+    """The shared body of both nightly toggles.
+
+    One implementation rather than two copies: both flips authorize unattended
+    paid uploads, so the validation, the failure posture and the disclosure rule
+    are the same decision and must not be able to drift apart. ``field`` is the
+    key the console reads back and ``what`` names the setting in the error text.
+    """
     target = await _account_target(request)
     if isinstance(target, web.Response):
         return target
@@ -2431,9 +2468,9 @@ async def _handle_backup_nightly(request: web.Request) -> web.Response:
     enabled = raw
     account, _profile, _region = target
     try:
-        await asyncio.to_thread(backup_mod.set_nightly, account, enabled)
+        await asyncio.to_thread(setter, account, enabled)
     except OSError:
-        # `set_nightly` now propagates rather than publishing over state it could
+        # The setters propagate rather than publishing over state they could
         # not read, so this toggle can genuinely fail to persist. It must fail
         # LOUDLY -- reporting a setting the next read contradicts is worse than an
         # error -- but as a structured failure, because every non-2xx this app
@@ -2443,12 +2480,34 @@ async def _handle_backup_nightly(request: web.Request) -> web.Response:
         # renders the absolute path of the state file, and there is no reason to
         # disclose a local filesystem path in a response body when the log below
         # already carries it for whoever is actually debugging.
-        logger.exception("aws-control: the nightly toggle could not be persisted")
+        logger.exception("aws-control: the %s toggle could not be persisted", what)
         return web.json_response(
-            {"error": "the nightly setting could not be saved", "code": "state_persist_failed"},
+            {"error": f"the {what} setting could not be saved", "code": "state_persist_failed"},
             status=500,
         )
-    return web.json_response({"nightly": enabled})
+    return web.json_response({field: enabled})
+
+
+async def _handle_backup_nightly(request: web.Request) -> web.Response:
+    return await _toggle_nightly(
+        request, setter=backup_mod.set_nightly, field="nightly", what="nightly"
+    )
+
+
+async def _handle_backup_nightly_sessions(request: web.Request) -> web.Response:
+    """Authorize unattended TRANSCRIPT uploads -- a separate grant, default off.
+
+    Deliberately its own route rather than a second field on the snapshot
+    toggle's body. A shared route would let one request carry both grants, and
+    the whole point of the separate bit is that the operator says yes to
+    transcripts as its own act.
+    """
+    return await _toggle_nightly(
+        request,
+        setter=backup_mod.set_nightly_sessions,
+        field="nightlySessions",
+        what="nightly sessions",
+    )
 
 
 async def _handle_backup_retention(request: web.Request) -> web.Response:
@@ -2671,6 +2730,10 @@ def register_routes(app: web.Application) -> None:
     r.add_post(
         f"{_BASE}/backup/{{account}}/retention",
         _guarded(_mutating("backup_retention")(_handle_backup_retention)),
+    )
+    r.add_post(
+        f"{_BASE}/backup/{{account}}/nightly-sessions",
+        _guarded(_mutating("backup_nightly_sessions")(_handle_backup_nightly_sessions)),
     )
     r.add_post(
         f"{_BASE}/backup/{{account}}/restore",

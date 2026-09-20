@@ -62,7 +62,13 @@ class TestAuthorizeUpload:
             return_value=json.dumps({"Account": "999988887777"}),
         ):
             with pytest.raises(RuntimeError, match="no longer points at"):
-                backup._authorize_upload(ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER)
+                backup._authorize_upload(
+                    ACCOUNT,
+                    "p",
+                    "us-west-2",
+                    caller=backup.CALLER_OWNER,
+                    payload_kind=backup.KIND_SNAPSHOT,
+                )
 
     def test_unparseable_sts_output_reads_as_no_account_and_refuses(self):
         # A garbled STS response must not be trusted as a match: it decodes to
@@ -70,7 +76,13 @@ class TestAuthorizeUpload:
         # upload is refused rather than proceeding on unknown identity.
         with mock.patch("kiro_crew.deploy.engine._checked", return_value="not json"):
             with pytest.raises(RuntimeError, match="no longer points at"):
-                backup._authorize_upload(ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER)
+                backup._authorize_upload(
+                    ACCOUNT,
+                    "p",
+                    "us-west-2",
+                    caller=backup.CALLER_OWNER,
+                    payload_kind=backup.KIND_SNAPSHOT,
+                )
 
     def test_upload_refused_when_app_disabled_during_build(self):
         # STS agrees, but the app was disabled while the archive built: the
@@ -83,7 +95,13 @@ class TestAuthorizeUpload:
             mock.patch("kiro_crew.apps.manager.is_app_enabled", return_value=False),
         ):
             with pytest.raises(RuntimeError, match="was disabled"):
-                backup._authorize_upload(ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER)
+                backup._authorize_upload(
+                    ACCOUNT,
+                    "p",
+                    "us-west-2",
+                    caller=backup.CALLER_OWNER,
+                    payload_kind=backup.KIND_SNAPSHOT,
+                )
 
     def test_upload_refused_when_s3_consent_no_longer_holds(self):
         # STS agrees and the app is on, but S3 consent was withdrawn: the
@@ -97,7 +115,13 @@ class TestAuthorizeUpload:
             mock.patch("kiro_crew.aws_consent.is_granted", return_value=(False, "expired")),
         ):
             with pytest.raises(RuntimeError, match="consent no longer holds.*expired"):
-                backup._authorize_upload(ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER)
+                backup._authorize_upload(
+                    ACCOUNT,
+                    "p",
+                    "us-west-2",
+                    caller=backup.CALLER_OWNER,
+                    payload_kind=backup.KIND_SNAPSHOT,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -176,13 +200,29 @@ class TestRunSnapshotBackup:
         # smaller number -- an off sweep costs no authorization round trip and no
         # listing call, so a fourth gate appearing here would mean the sweep had
         # started doing cloud work on an install that never asked for it.
+        #
+        # Each write also NAMES what it carries, which is what lets the gate
+        # re-read the unattended grant for the right payload. The archive is the
+        # snapshot's payload; the two label writes are one caption published under
+        # both prefixes and are nobody's payload, so they name none.
+        #
+        # The write gates are checked field by field rather than against a whole
+        # expected call: they now carry `payload_kind` as well, so an equality
+        # against a fixed call would assert the ABSENCE of that argument, which is
+        # the opposite of what the line above pins.
         assert authz.call_count == 3
         write_gates = [c for c in authz.call_args_list if "operation" not in c.kwargs]
         assert len(write_gates) == 3
-        for call in write_gates:
-            assert call == mock.call(ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER)
         sweep_gates = [c for c in authz.call_args_list if "operation" in c.kwargs]
         assert sweep_gates == []
+        assert [c.kwargs["payload_kind"] for c in authz.call_args_list] == [
+            backup.KIND_SNAPSHOT,
+            None,
+            None,
+        ]
+        for call in authz.call_args_list:
+            assert call.args == (ACCOUNT, "p", "us-west-2")
+            assert call.kwargs["caller"] == backup.CALLER_OWNER
         # Two pushes now: the archive, then this install's label sidecar beside it.
         # The label is what stops another install's rows reading as 32 hex
         # characters, and it is published from here because this is the one place

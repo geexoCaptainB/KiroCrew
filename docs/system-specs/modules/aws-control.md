@@ -774,6 +774,54 @@ of the schedule: with the keys namespaced there is nothing left to collide, and 
 single-owner schedule would leave one machine silently un-backed-up, which is
 discovered at restore time and is worse than the state it replaced.
 
+### The nightly sessions archive is a second, separate grant
+
+`backup.nightly_sessions_enabled` authorizes the scheduled SESSIONS archive and
+is never `nightly`. The two answer different questions -- one about memory and
+workspace, one about every conversation the agent was ever shown -- so an
+operator who enabled nightly snapshots has said nothing about transcripts. The
+key is absent by default and an absent key reads False, so no install begins
+uploading transcripts by being upgraded. Both read fail-closed: an unreadable
+state file answers False, because a corrupt file must never be the reason an
+unattended upload starts.
+
+Due-ness is keyed per kind (`backup.due_for_sessions_nightly` against
+`KIND_SESSIONS`), so a snapshot that ran an hour ago does not make the
+transcripts look backed up, and a wake proceeds when EITHER kind is due. Each
+kind is pushed inside its own `hooks._push_nightly` call with its own
+try/except and its own audit subject (`backup/snapshots`, `backup/sessions`), so
+one kind failing costs the other nothing and an incident review can tell which
+bytes left the host. A platform without descriptor-pinned traversal is never due
+for the archive: `run_sessions_backup` refuses there, so scheduling it would
+record a failed run every wake for a payload that platform cannot produce.
+
+The grant is settable on every registered account while the loop runs for the one
+`resolve_default_account_profile` names, so "granted" and "will run" are separate
+answers and `backup.scheduled_sessions_blocked_code` carries the second. Its
+`scheduled_account` argument is the part only a per-account surface can answer:
+the status route compares its target against `accounts.default_account_id` -- the
+account half of the loop's own resolution, so the two cannot disagree about which
+account is scheduled -- and reports `other_account` when they differ. The console
+renders that beside the switch, which keeps reading back exactly as the owner set
+it. Without it a grant recorded on a second account is authorized and unreachable
+at once, and the operator learns which at the host loss the feature exists to
+survive. The loop never sees that code: it reads the scheduling answer for the
+account it just resolved, where the condition is false by construction, which is
+why `scheduled_sessions_blocked_reason` covers only the other two conditions.
+A host that cannot produce the archive outranks the account, because naming the
+account would send the operator to a page carrying the same notice.
+
+The scheduled path calls `backup.run_sessions_backup` unchanged, with the same
+arguments the owner-triggered job passes and `CALLER_SCHEDULED`. So the
+archive's CONTENTS, its redaction posture and its size behaviour are not
+decided here and are not changed by scheduling: both session halves ship as they
+are, byte-exact and unredacted, exactly as the owner-triggered archive already
+ships them, and the push shares the one `_PUSH_TIMEOUT_SECS` budget. Whether
+that posture is right for the archive at all is a question about the archive,
+tracked on its own; the scheduler inherits whatever that path decides, because it
+is the same function. What scheduling adds is one consent bit that is strictly
+narrower than the owner-triggered route's gate, never wider.
+
 ## Dashboard surface
 
 The app opens on an Overview pane, not on a listing: a strip of metric cards

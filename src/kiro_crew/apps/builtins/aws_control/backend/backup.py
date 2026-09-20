@@ -65,10 +65,11 @@ import tarfile
 import tempfile
 import threading
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NoReturn, Optional
 
-from kiro_crew import snapshot
+from kiro_crew import snapshot, snapshot_redact
 from kiro_crew.apps.builtins.aws_control.backend import accounts as accounts_mod
 from kiro_crew.apps.builtins.aws_control.backend import storage
 from kiro_crew.apps.manager import app_data_dir
@@ -1193,7 +1194,13 @@ def _refuse_upload(
 
 
 def _authorize_upload(
-    account: str, profile: str, region: str, *, caller: str, operation: str = SEL_OP_UPLOAD
+    account: str,
+    profile: str,
+    region: str,
+    *,
+    caller: str,
+    payload_kind: Optional[str],
+    operation: str = SEL_OP_UPLOAD,
 ) -> None:
     """Re-check the authorization decisions at the moment of upload.
 
@@ -1203,6 +1210,13 @@ def _authorize_upload(
     not left the machine until ``put_file`` runs. The account check is a LIVE
     ``sts:GetCallerIdentity`` (free, non-mutating) through the package's
     single sync chokepoint, not the cached snapshot.
+
+    ``payload_kind`` names the kind whose payload these bytes ARE, and is
+    required with no default for the same reason ``caller`` is: the value that
+    would make a sensible default is the one that checks nothing. ``None`` is a
+    real answer, not an opt-out -- it says this write carries no kind's payload
+    (the caption in :func:`_publish_label`, which is written under both prefixes
+    on purpose), so no per-kind grant governs it.
     """
     import json as _json
 
@@ -1272,6 +1286,57 @@ def _authorize_upload(
             caller=caller,
             operation=operation,
         )
+    # The unattended grant, re-read here and nowhere else in this gate. Every
+    # other check above is about whether we may reach AWS at all; this one is
+    # about whether the owner still wants THIS payload sent, which is a
+    # different question and the only one whose withdrawal is unrecoverable once
+    # ignored -- transcripts on S3 cannot be taken back. The window is the same
+    # minutes-long build window the checks above already exist for, so leaving
+    # this one out would defend every authorization except the one the operator
+    # is most likely to change their mind about.
+    #
+    # Scheduled callers only. An owner who clicked the button is present and
+    # authorized the run by clicking; the nightly bit is not their permission
+    # slip, it is the one standing in for a person who is not there.
+    if caller == CALLER_SCHEDULED and payload_kind is not None:
+        reader = _NIGHTLY_CONSENT_READERS.get(payload_kind)
+        if reader is None:
+            # Fail closed on a kind nobody registered a grant for, rather than
+            # letting it through on the strength of not being listed. A kind
+            # added without its bit is then refused loudly instead of uploading
+            # unattended under no authorization at all.
+            _refuse_upload(
+                account,
+                f"no unattended grant is defined for {payload_kind!r}; upload refused",
+                caller=caller,
+            )
+        elif not reader(account):
+            _refuse_upload(
+                account,
+                "the unattended grant for this payload no longer holds; upload refused",
+                caller=caller,
+            )
+    # The same re-read, for the other precondition a scheduled transcript upload
+    # stands on. The grant above answers "does the owner still want this sent";
+    # this answers "may a scheduled transcript archive be sent at all", and it can
+    # change during the build for the same reason the grant can: the operator acts
+    # while the archive is being written. Turning redaction ON mid-build is an
+    # ordinary thing to do, and the already-built archive is unredacted -- the
+    # sessions payload has no redaction seam, which is the whole reason the
+    # nightly is withheld when redaction is on. Without this the build starts
+    # under one answer and the PUT proceeds on it after it stopped being true.
+    #
+    # Deliberately the same predicate the due-check reads rather than a second
+    # spelling of it: a cause added there is then refused here too, with nobody
+    # having to remember this call site exists.
+    if caller == CALLER_SCHEDULED and payload_kind == KIND_SESSIONS:
+        blocked_now = scheduled_sessions_blocked_reason()
+        if blocked_now is not None:
+            _refuse_upload(
+                account,
+                f"a scheduled transcript upload is no longer allowed here: {blocked_now}",
+                caller=caller,
+            )
     # Last, and deliberately after every other check: app teardown. A worker
     # thread cannot be killed, so cancelling the loop's await leaves the archive
     # build running; this is what makes that build stop short of uploading.
@@ -1436,7 +1501,17 @@ def _delete_under_the_retention_gate(
         # already taken for the delete: a longer wait for other state writers buys a
         # delete that cannot run on authority withdrawn while this waited.
         try:
-            _authorize_upload(account, profile, region, caller=caller, operation=SEL_OP_RETENTION)
+            _authorize_upload(
+                account,
+                profile,
+                region,
+                caller=caller,
+                # A retention sweep DELETES archives; it uploads no kind's payload,
+                # so no per-kind unattended grant governs it. The account, app and
+                # consent checks above it still do.
+                payload_kind=None,
+                operation=SEL_OP_RETENTION,
+            )
         except Exception as exc:
             raise _RetentionAuthorizationWithdrawn(exc) from exc
         return storage.delete_object_versions(
@@ -1715,7 +1790,17 @@ def _prune_remote_archives(
     # `_refuse_upload` -- an expired credential, a dead STS call -- files nothing
     # by itself, so `_audit_unfiled_authorization` covers exactly that half.
     try:
-        _authorize_upload(account, profile, region, caller=caller, operation=SEL_OP_RETENTION)
+        _authorize_upload(
+            account,
+            profile,
+            region,
+            caller=caller,
+            # A retention sweep DELETES archives; it uploads no kind's payload,
+            # so no per-kind unattended grant governs it. The account, app and
+            # consent checks above it still do.
+            payload_kind=None,
+            operation=SEL_OP_RETENTION,
+        )
     except Exception as exc:
         outcome["skipped"] = "authorization refused"
         # `redact_log_via_context`, not the two bare egress redactors this module
@@ -2047,7 +2132,14 @@ def _publish_label(
                 # Inside the loop, not before it. The first PUT is an S3 round trip,
                 # so a gate hoisted above the loop would leave the second write
                 # running on a decision taken before that trip.
-                _authorize_upload(account, profile, region, caller=caller)
+                #
+                # `payload_kind=None` because this write is not any kind's payload:
+                # it is one document, a label and a time, deliberately published
+                # under BOTH prefixes. Keying it to the prefix it happens to be
+                # writing would make an install with one kind's nightly off lose
+                # that prefix's caption -- which is a rename going unseen, not a
+                # transcript leaving the machine.
+                _authorize_upload(account, profile, region, caller=caller, payload_kind=None)
                 storage.put_file(
                     profile,
                     region,
@@ -2109,7 +2201,7 @@ def run_snapshot_backup(
         # that authorizes these bytes cannot go stale before they leave. The
         # label's own PUT takes its own authorization inside `_publish_label`,
         # which is why it can safely run afterwards.
-        _authorize_upload(account, profile, region, caller=caller)
+        _authorize_upload(account, profile, region, caller=caller, payload_kind=KIND_SNAPSHOT)
         version = storage.put_file(
             profile,
             region,
@@ -2323,7 +2415,7 @@ def run_sessions_backup(
         # that authorizes these bytes cannot go stale before they leave. The
         # label's own PUT takes its own authorization inside `_publish_label`,
         # which is why it can safely run afterwards.
-        _authorize_upload(account, profile, region, caller=caller)
+        _authorize_upload(account, profile, region, caller=caller, payload_kind=KIND_SESSIONS)
         version = storage.put_file(
             profile,
             region,
@@ -2456,7 +2548,7 @@ def make_job_runner(sdk: Any, kind: str) -> Any:
         # build takes minutes, and consent can be withdrawn during it. This one
         # decides whether we may touch AWS at all; that one decides whether the
         # bytes may leave. Both are needed, and both audit through the same helper.
-        _authorize_upload(account, profile, region, caller=CALLER_OWNER)
+        _authorize_upload(account, profile, region, caller=CALLER_OWNER, payload_kind=kind)
         bucket = storage.find_drive(profile, region, account=account)
         if not bucket:
             raise RuntimeError("this account has no drive yet; nothing was sent to AWS")
@@ -2867,6 +2959,27 @@ def _account_view(account: str) -> dict[str, Any]:
     return _account_view_checked(account)[0]
 
 
+def _granted(account: str, key: str) -> bool:
+    """Whether one unattended-upload consent bit is stored as a real ``True``.
+
+    ``is True`` and not ``bool(...)``, because every other reader in this file
+    treats a non-conforming state file as something to survive rather than
+    something that cannot happen -- ``_account_view`` flattens a corrupt level to
+    empty, ``_a_day_since_last_run`` catches a non-string stamp. Inside that
+    recognized corruption class a truthy non-bool (the string ``"false"`` is the
+    cheap example) would read as consent GRANTED, which turns a bit documented as
+    fail-closed into a fail-open one. The only writers are ``set_nightly`` and
+    ``set_nightly_sessions``, both of which store ``bool(...)``, so nothing this
+    package produces is rejected by the stricter read.
+
+    Shared by both consent bits deliberately. Two readers of the same kind of
+    answer, one strict and one not, is the shape that drifts: whichever is looser
+    becomes the way in, and a reader comparing them cannot tell which strictness
+    was intended.
+    """
+    return _account_view(account).get(key) is True
+
+
 def nightly_enabled(account: str) -> bool:
     """Whether the owner has authorized unattended uploads for this account.
 
@@ -2882,7 +2995,7 @@ def nightly_enabled(account: str) -> bool:
     record of something that ALREADY happened and is already paid for, so
     dropping it does not prevent a charge, it causes one.
     """
-    return bool(_account_view(account).get("nightly"))
+    return _granted(account, "nightly")
 
 
 def set_nightly(account: str, enabled: bool) -> None:
@@ -2948,6 +3061,47 @@ def retention_keep(account: str) -> int | None:
     return _retention_keep_for_sweep(account)[0]
 
 
+def nightly_sessions_enabled(account: str) -> bool:
+    """Whether the owner has authorized unattended TRANSCRIPT uploads.
+
+    A SEPARATE key from ``nightly``, and never a read of it. The two
+    authorizations are not the same question: ``nightly`` authorizes uploading
+    the memory and workspace snapshot, while this one authorizes uploading
+    everything the agent was ever shown. Riding the snapshot's bit would mean an
+    operator who said yes to "back up my memory" had also, without being asked,
+    said yes to "upload my conversations".
+
+    Fail-closed for the same reason :func:`nightly_enabled` is: an unreadable
+    state file must not become a reason to start uploading transcripts. The
+    absent key answers False, so every install that has not asked for this is
+    off, and :func:`_granted` requires a real ``True`` so a corrupt truthy value
+    cannot answer for the owner either.
+    """
+    return _granted(account, "nightly_sessions")
+
+
+def set_nightly_sessions(account: str, enabled: bool) -> None:
+    def mutate(state: dict[str, Any]) -> None:
+        _account_state(state, account)["nightly_sessions"] = bool(enabled)
+
+    _locked_state_update(mutate)
+
+
+#: The bit that authorizes each kind's UNATTENDED upload, read by
+#: :func:`_authorize_upload` immediately before the payload leaves.
+#:
+#: A lookup rather than a branch, and a lookup that is asserted COMPLETE against
+#: :data:`JOB_KINDS` by its own test, because the failure this table exists to
+#: prevent is silent: a kind added without a bit would otherwise fall through to
+#: whatever the code does when it finds nothing. Here finding nothing refuses.
+#: Each kind maps to its OWN reader and never to another's, so no kind can end up
+#: uploaded on a grant the owner gave for something else.
+_NIGHTLY_CONSENT_READERS: dict[str, Callable[[str], bool]] = {
+    KIND_SNAPSHOT: nightly_enabled,
+    KIND_SESSIONS: nightly_sessions_enabled,
+}
+
+
 def last_runs(account: str) -> dict[str, Any]:
     """The last run per kind, including runs this process could not persist.
 
@@ -2962,11 +3116,15 @@ def last_runs(account: str) -> dict[str, Any]:
         return _merge_unpersisted(account, runs)
 
 
-def due_for_nightly(account: str, now: Optional[dt.datetime] = None) -> bool:
-    """True when the nightly snapshot has not run in the last ~23 hours."""
-    if not nightly_enabled(account):
-        return False
-    runs = last_runs(account).get(KIND_SNAPSHOT)
+def _a_day_since_last_run(account: str, kind: str, now: Optional[dt.datetime]) -> bool:
+    """True when ``kind`` has not completed a run in the last ~23 hours.
+
+    The stamp reasoning is shared by every nightly kind, so it lives once. The
+    CONSENT question is deliberately not in here: each kind reads its own bit at
+    its own call site, so a new kind cannot inherit another kind's grant by
+    calling a helper that already answered it.
+    """
+    runs = last_runs(account).get(kind)
     if not runs:
         return True
     try:
@@ -2984,3 +3142,147 @@ def due_for_nightly(account: str, now: Optional[dt.datetime] = None) -> bool:
         last = last.replace(tzinfo=dt.timezone.utc)
     now = now or dt.datetime.now(dt.timezone.utc)
     return (now - last).total_seconds() > 23 * 3600
+
+
+def due_for_nightly(account: str, now: Optional[dt.datetime] = None) -> bool:
+    """True when the nightly snapshot has not run in the last ~23 hours."""
+    if not nightly_enabled(account):
+        return False
+    return _a_day_since_last_run(account, KIND_SNAPSHOT, now)
+
+
+def _unattended_sessions_redaction_gap() -> Optional[str]:
+    """Why an operator who asked for redaction gets no UNATTENDED transcript upload.
+
+    ``None`` when nothing stands in the way. Redaction is opt-IN and off by
+    default (see ``snapshot_redact.outbound_redaction_enabled``), and the default
+    is not an oversight: the destination is owner-only and re-verified at every
+    upload, so the documented trade is that hardening protects the payload and
+    redaction is a rewrite an operator may additionally ask for.
+
+    The asymmetry this closes is narrow and only exists for an operator who DID
+    ask. :func:`run_snapshot_backup` routes its payload through
+    ``snapshot.prepare_redacted_copy`` and so honours the switch; the sessions
+    archive cannot use that seam, because it refuses an archive with more than one
+    root ("expected one bundle root to redact") and this one has two, ``crew`` and
+    ``cli``. So for that operator the snapshot leaves redacted and the transcripts
+    would leave unredacted -- while transcripts are the payload most likely to
+    hold a pasted secret in the first place.
+
+    Refusing rather than uploading, because ``_redacted_upload_copy``'s own rule
+    is that "could not redact" must never fall through to "send it unredacted",
+    and unattended is exactly where nobody is present to notice that it did.
+
+    Scheduled path only. An owner pressing the button is present and is choosing
+    this archive knowingly, and that path shipped before the nightly existed;
+    reading this at :func:`kind_unavailable_reason` instead would take a working
+    button away from them.
+    """
+    try:
+        if not snapshot_redact.outbound_redaction_enabled():
+            return None
+    except snapshot_redact.RedactionSwitchUnreadable as exc:
+        # Cannot tell which way the operator set it. Off would ignore a request to
+        # scrub and on cannot be honoured here, so the unattended path declines
+        # rather than guessing silently in either direction.
+        #
+        # The exception goes to the log and NOT into the returned string, because
+        # this string is console copy: it reaches the owner under the nightly
+        # switch, where an exception repr is noise they cannot act on. The log is
+        # where a person diagnosing it looks, and it keeps the detail in full.
+        logger.warning("the outbound redaction switch could not be read: %s", exc)
+        return (
+            "the outbound redaction setting for this account could not be read, so an "
+            "unattended transcript upload is declined until it can be"
+        )
+    return (
+        "this account has outbound redaction turned on, and the sessions archive cannot be "
+        "redacted on the way out yet. An unattended upload is declined rather than sent "
+        "unredacted; an owner-triggered archive still runs, since somebody is present to "
+        "choose it."
+    )
+
+
+BLOCK_HOST_UNSUPPORTED = "host_unsupported"
+BLOCK_REDACTION_ON = "redaction_on"
+BLOCK_OTHER_ACCOUNT = "other_account"
+
+
+def scheduled_sessions_blocked_code(*, scheduled_account: bool = True) -> Optional[str]:
+    """Which condition stops a nightly transcript archive here, or ``None``.
+
+    A stable token rather than a sentence, because the one surface that shows this
+    to a person has to say it in their language and a sentence chosen here can only
+    ever be English. The prose below is derived from this, so the console and the
+    log agree on WHICH condition holds while each words it for its own reader.
+
+    Every condition in one place, because a caller asking "can this run" wants the
+    answer and not a list of causes to check. The capability comes first: it is a
+    property of the machine that no setting changes, while the redaction gap is
+    something the operator can act on.
+
+    ``scheduled_account`` is the caller's answer to "is the account being asked
+    about the one the nightly loop runs for". It is a question only a SURFACE can
+    be wrong about: the loop reads this for the account it just resolved, so the
+    condition is false there by construction, which is why the default keeps every
+    scheduling caller reading exactly as before. A per-account console is the
+    caller that must pass it -- the grant is settable on any account while the
+    loop resolves one, so without this an operator can switch transcripts on for a
+    second account and be shown a running schedule that nothing will ever run.
+    """
+    if kind_unavailable_reason(KIND_SESSIONS) is not None:
+        return BLOCK_HOST_UNSUPPORTED
+    if _unattended_sessions_redaction_gap() is not None:
+        return BLOCK_REDACTION_ON
+    if not scheduled_account:
+        return BLOCK_OTHER_ACCOUNT
+    return None
+
+
+def scheduled_sessions_blocked_reason() -> Optional[str]:
+    """The same answer in prose, for logs, audit subjects and upload refusals.
+
+    The grant and this are separate answers on purpose. The grant is what the
+    owner asked for and must read back exactly as they set it; this says whether
+    asking for it achieves anything on this host, which is what lets a surface
+    show the switch as granted AND say it is not running. Reporting only the
+    grant is what makes the failure silent, and silent is the whole cost here: an
+    owner sees transcripts scheduled, nothing ever uploads, and they find out at
+    the host loss the feature exists to survive.
+
+    Derived from :func:`scheduled_sessions_blocked_code` rather than deciding
+    again, so prose can only ever describe the condition that function selected.
+    """
+    code = scheduled_sessions_blocked_code()
+    if code is None:
+        return None
+    if code == BLOCK_HOST_UNSUPPORTED:
+        return kind_unavailable_reason(KIND_SESSIONS)
+    return _unattended_sessions_redaction_gap()
+
+
+def due_for_sessions_nightly(account: str, now: Optional[dt.datetime] = None) -> bool:
+    """True when the nightly SESSIONS archive is authorized, possible, and due.
+
+    Three conditions, and the middle one is why this is not just
+    :func:`due_for_nightly` with a different kind. A platform without
+    descriptor-pinned traversal is NEVER due: :func:`run_sessions_backup` refuses
+    there by design, so calling it anyway would raise on every wake, record a
+    failed run and audit a failure every half hour for a payload that platform
+    can never produce. Answering "not due" makes the capability question a
+    scheduling fact rather than a recurring error.
+
+    The redaction gap is read the same way and for the same reason: where the
+    operator has asked for outbound redaction this payload cannot honour, the
+    honest scheduling answer is "not due" rather than an unattended upload that
+    ignores what they asked for.
+
+    Both are read through :func:`scheduled_sessions_blocked_reason`, which is also
+    what the status route reports. One predicate, so a surface cannot show this
+    grant as running while the loop withholds it, or the reverse.
+    """
+    if not nightly_sessions_enabled(account):
+        return False
+    if scheduled_sessions_blocked_reason() is not None:
+        return False
+    return _a_day_since_last_run(account, KIND_SESSIONS, now)

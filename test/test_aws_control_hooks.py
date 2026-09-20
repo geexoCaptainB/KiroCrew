@@ -282,11 +282,12 @@ class TestSharedDriveNotice:
         assert not [c for c in audit.call_args_list if c.args[0] == "backup_shared_drive"]
 
     def test_the_notice_costs_exactly_one_paid_list_call(self):
-        # The nightly uploads snapshots and nothing else, so it asks about the
-        # snapshot prefix and stops. Sweeping both prefixes spent a second paid
-        # LIST on every scheduled run to answer a question about a run that is not
-        # happening -- a real cost on the one path that spends without a human
-        # present, which is exactly where an unread call is least defensible.
+        # One prefix is enough to ANSWER the question the notice asks -- "does
+        # another install write to this drive" -- so the sweep stays at one paid
+        # LIST however many kinds the nightly pushes. Sweeping every prefix spent
+        # an extra paid LIST per scheduled run to re-derive an answer already in
+        # hand, a real cost on the one path that spends without a human present,
+        # which is exactly where an unread call is least defensible.
         with mock.patch.object(hooks.backup_mod, "_install_folders", return_value=set()) as folders:
             hooks.backup_mod.other_install_ids("p", "us-west-2", "bkt", account="111122223333")
         assert folders.call_count == 1

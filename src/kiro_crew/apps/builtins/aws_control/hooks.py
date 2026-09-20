@@ -142,28 +142,96 @@ async def _run_once() -> None:
         logger.info("aws-control nightly: account unresolved; skipping")
         return
     account = identity.account
-    if not await asyncio.to_thread(backup_mod.due_for_nightly, account):
+    # Two independent grants, each read on its own. A wake proceeds when EITHER
+    # is due, so a snapshot that already ran today cannot swallow the window the
+    # transcripts were authorized for -- and neither bit is ever inferred from
+    # the other.
+    snapshot_due = await asyncio.to_thread(backup_mod.due_for_nightly, account)
+    sessions_due = await asyncio.to_thread(backup_mod.due_for_sessions_nightly, account)
+    if not snapshot_due and not sessions_due:
+        # Say why when the grant is on and something else is withholding the run.
+        # Without this the operator who turned transcripts on, and then turned
+        # outbound redaction on, sees a nightly that silently never runs and no
+        # statement anywhere of which of their two settings withheld it.
+        if await asyncio.to_thread(backup_mod.nightly_sessions_enabled, account):
+            gap = await asyncio.to_thread(backup_mod._unattended_sessions_redaction_gap)
+            if gap:
+                logger.info("aws-control nightly: transcripts withheld -- %s", gap)
         return
     allowed = await aws_consent.refuse_and_log(
         aws_consent.SERVICE_S3, profile=profile, region=region
     )
     if not allowed:
         return  # refuse_and_log already logged + audited
+    # The kinds this wake is actually for, derived once. The shared setup below
+    # can fail before any push, and a failure there must name the kinds that were
+    # due rather than one fixed kind: a transcripts-only wake reaches the same
+    # block, so a hardcoded `backup/snapshots` would record a snapshot that was
+    # never due, and the SEL trail is append-only. Deriving the list here also
+    # means the subjects a failure is audited against and the kinds actually
+    # pushed below cannot drift apart -- they are the same list.
+    due_kinds = [
+        kind
+        for kind, is_due in (
+            (backup_mod.KIND_SNAPSHOT, snapshot_due),
+            (backup_mod.KIND_SESSIONS, sessions_due),
+        )
+        if is_due
+    ]
     try:
         bucket = await asyncio.to_thread(storage_mod.find_drive, profile, region, account=account)
         if not bucket:
             logger.info("aws-control nightly: no drive bucket yet; skipping")
             return
         await _note_shared_drive(profile, region, bucket, account)
+    except asyncio.CancelledError:
+        for kind in due_kinds:
+            _audit("backup_nightly", _audit_subject(kind), "cancelled")
+        raise
+    except Exception as exc:
+        for kind in due_kinds:
+            _audit("backup_nightly", _audit_subject(kind), "failed", error=str(exc))
+        logger.warning("aws-control nightly backup failed", exc_info=True)
+        return
+    for kind in due_kinds:
+        await _push_nightly(kind, account, profile, region, bucket)
+
+
+def _audit_subject(kind: str) -> str:
+    """The SEL subject for one backup kind.
+
+    One spelling, used by the shared setup's failure handlers and by
+    :func:`_push_nightly` alike. Two copies of this expression is how a run's
+    setup failure and its push end up filed under different subjects for the
+    same kind, which is exactly the misattribution this exists to prevent.
+    """
+    return f"backup/{backup_mod.KIND_SUBPATHS[kind]}"
+
+
+async def _push_nightly(kind: str, account: str, profile: str, region: str, bucket: str) -> None:
+    """Push one due nightly kind, audited around the call.
+
+    Each kind gets its OWN try/except rather than sharing one. The two payloads
+    have nothing in common but the drive they land in, so a snapshot that fails
+    must not cost the transcripts their window, and the reverse. A shared handler
+    would turn one failure into two skipped nights.
+    """
+    subject = _audit_subject(kind)
+    runner = (
+        backup_mod.run_snapshot_backup
+        if kind == backup_mod.KIND_SNAPSHOT
+        else backup_mod.run_sessions_backup
+    )
+    try:
         # The nightly path never touches an HTTP handler, so the audit the
         # dashboard layer adds to every owner-driven mutation is simply absent
         # here -- an unattended export would leave no SEL trace of having run,
         # succeeded or failed. Emit the same three-part record the handlers do,
         # around the call, so the trail does not depend on who triggered it.
-        _audit("backup_nightly", "backup/snapshots", "invoked")
+        _audit("backup_nightly", subject, "invoked")
         record = await asyncio.to_thread(
             functools.partial(
-                backup_mod.run_snapshot_backup,
+                runner,
                 account,
                 profile,
                 region,
@@ -177,11 +245,11 @@ async def _run_once() -> None:
         _audit("backup_nightly", str(record.get("key", "")), "succeeded")
         logger.info("aws-control nightly backup pushed: %s", record.get("key", ""))
     except asyncio.CancelledError:
-        _audit("backup_nightly", "backup/snapshots", "cancelled")
+        _audit("backup_nightly", subject, "cancelled")
         raise
     except Exception as exc:
-        _audit("backup_nightly", "backup/snapshots", "failed", error=str(exc))
-        logger.warning("aws-control nightly backup failed", exc_info=True)
+        _audit("backup_nightly", subject, "failed", error=str(exc))
+        logger.warning("aws-control nightly backup failed: %s", kind, exc_info=True)
 
 
 async def _loop() -> None:

@@ -89,6 +89,63 @@ const START_ERROR_KEYS: Record<string, string> = {
   drive_missing: 'apps.awsControl.console.backup_start_no_drive',
   jobs_unavailable: 'apps.awsControl.console.backup_start_unavailable',
 }
+
+/**
+ * Why the nightly transcript archive is not running, in the reader's language.
+ *
+ * The backend sends a stable code, not a sentence: it cannot know the reader's
+ * locale, so a sentence chosen there is English on every install. An unrecognised
+ * code falls through to the general line rather than rendering nothing, because a
+ * newer gateway can name a condition this build has never heard of -- and "on
+ * hold" is true of all of them, which is far better than letting the page imply
+ * the backup is fine.
+ *
+ * A switch over static map access rather than an indexed lookup, so every key
+ * here stays findable by the i18n gate instead of counting as a dynamic site.
+ */
+const BACKUP_BLOCKED_KEYS = {
+  host: 'apps.awsControl.console.backup_nightly_sessions_blocked_host',
+  redaction: 'apps.awsControl.console.backup_nightly_sessions_blocked_redaction',
+  otherAccount: 'apps.awsControl.console.backup_nightly_sessions_blocked_other_account',
+  other: 'apps.awsControl.console.backup_nightly_sessions_blocked_other',
+} as const
+
+/* The two "you can still start it yourself" lines, literal for the same reason as
+   the map above: named property access keeps each key findable by the i18n gate. */
+const BACKUP_NEXT_KEYS = {
+  generic: 'apps.awsControl.console.backup_nightly_sessions_blocked_next',
+  redaction: 'apps.awsControl.console.backup_nightly_sessions_blocked_next_redaction',
+} as const
+
+function nightlySessionsBlockedText(code: string): string {
+  switch (code) {
+    case 'host_unsupported': return i18nT(BACKUP_BLOCKED_KEYS.host)
+    case 'redaction_on': return i18nT(BACKUP_BLOCKED_KEYS.redaction)
+    case 'other_account': return i18nT(BACKUP_BLOCKED_KEYS.otherAccount)
+    default: return i18nT(BACKUP_BLOCKED_KEYS.other)
+  }
+}
+
+/* Which "you can still start it yourself" line to offer under the notice, or
+   null for none. The manual run is per-account and per-kind, so it is a real next
+   step for a grant withheld by a setting or recorded on an account the schedule
+   does not visit -- and NOT one on a host that cannot produce the archive at all,
+   where that same run refuses with the same capability answer. Naming a click
+   that fails is worse than naming none.
+
+   `redaction_on` gets its OWN line because there the manual run's outcome is the
+   very thing the notice above it withheld: the nightly stands down precisely
+   because the sessions archive has no redaction seam (it has two bundle roots, so
+   `prepare_redacted_copy` refuses it), and the button uploads those same bytes
+   unredacted. The backend calls that owner "present and choosing knowingly", which
+   is only true if the page says what the choice is -- and the operator reading this
+   notice is by definition one who asked for redaction. */
+function nightlySessionsBlockedNextText(code: string): string | null {
+  if (code === 'host_unsupported') return null
+  if (code === 'redaction_on') return i18nT(BACKUP_NEXT_KEYS.redaction)
+  return i18nT(BACKUP_NEXT_KEYS.generic)
+}
+
 const KIND_LABEL_KEY: Record<ArtifactKind, string> = {
   widget: 'apps.awsControl.console.kind_widget',
   markdown: 'apps.awsControl.console.kind_markdown',
@@ -3770,12 +3827,18 @@ function BackupRow({
   kind,
   run,
   job,
+  unsupported,
   onStarted,
 }: {
   account: string
   kind: BackupKind
   run: BackupRun | undefined
   job: BackupJobState | undefined
+  /* This host cannot produce this kind's payload at all. The manual run answers
+     the same capability question and refuses with 501, so a pressable button here
+     offers work that cannot happen -- and the notice under the switch already
+     says why, which is the sentence a disabled button sends the reader to. */
+  unsupported: boolean
   onStarted: () => void
 }) {
   const runMut = useMutation({
@@ -3862,7 +3925,11 @@ function BackupRow({
             ? i18nT('apps.awsControl.console.backup_state_current')
             : i18nT('apps.awsControl.console.backup_state_never')}
         </Badge>
-        <Btn onClick={() => runMut.mutate()} disabled={busy} data-testid={`backup-run-${kind}`}>
+        <Btn
+          onClick={() => runMut.mutate()}
+          disabled={busy || unsupported}
+          data-testid={`backup-run-${kind}`}
+        >
           <RefreshCw size={13} className={busy ? 'animate-spin' : ''} />
           {busy ? i18nT('apps.awsControl.console.backup_running') : i18nT('apps.awsControl.console.backup_run_now')}
         </Btn>
@@ -3943,6 +4010,13 @@ export function BackupSection({ account }: { account: string }) {
   const invalidate = () => qc.invalidateQueries({ queryKey: ['aws-control', 'backup', account] })
   const nightlyMut = useMutation({
     mutationFn: (enabled: boolean) => awsControlApi.backupNightly(account, enabled),
+    onSuccess: invalidate,
+  })
+  // A separate mutation, not a parameter on the one above: the two grants are
+  // separate requests to separate endpoints, and a failure to record one must
+  // leave the other's switch exactly where it was.
+  const nightlySessionsMut = useMutation({
+    mutationFn: (enabled: boolean) => awsControlApi.backupNightlySessions(account, enabled),
     onSuccess: invalidate,
   })
   // The label decides only what a human reads; the restore gate never consults
@@ -4043,6 +4117,10 @@ export function BackupSection({ account }: { account: string }) {
               // Account-scoped: this payload answers "is a backup running for THIS
               // account", which the app-scoped `_jobs/active` surface cannot.
               job={data.jobs?.[kind]}
+              /* Only the sessions kind has a reported capability answer, and it is
+                 host-wide rather than per-account, so it is the same answer the
+                 manual run would give. */
+              unsupported={kind === 'sessions' && data.nightlySessionsBlocked === 'host_unsupported'}
               // Re-read immediately after a start, rather than waiting out the
               // poll gap and looking like the click did nothing.
               onStarted={invalidate}
@@ -4064,8 +4142,70 @@ export function BackupSection({ account }: { account: string }) {
               <AwsErrorNotice
                 askAgent
                 error={nightlyMut.error}
-                message={i18nT('apps.awsControl.console.backup_nightly_failed')}
+                message={i18nT('apps.awsControl.console.backup_nightly_failed', {
+                  setting: i18nT('apps.awsControl.console.backup_nightly'),
+                })}
                 testId="backup-nightly-error"
+              />
+            </div>
+          )}
+          {/* The transcript grant, and deliberately a SECOND switch rather than a
+              wider meaning for the one above. The switch above was answered about
+              memory; conversations are the most sensitive payload here, so the
+              operator is asked separately and the answer defaults to off. The hint
+              states what the archive carries, because an unattended upload the
+              operator misunderstood is the failure that matters. */}
+          <div className="flex items-center justify-between gap-3 px-3 py-2.5" data-testid="backup-nightly-sessions">
+            <div className="min-w-0">
+              <div className="text-[13px] font-medium text-text">{i18nT('apps.awsControl.console.backup_nightly_sessions')}</div>
+              <div className="text-[12px] text-muted">
+                {i18nT('apps.awsControl.console.backup_nightly_sessions_hint')}{' '}
+                {/* The SAME string the archive row above carries, not a paraphrase
+                    of it. This is the sentence the owner consents on, and the row
+                    it schedules says the payload reaches past chats started here
+                    into every session under this Kiro home. A hint that says less
+                    than the row asks for a yes to more than it states, and two
+                    wordings of one scope would drift; one string cannot. */}
+                {i18nT('apps.awsControl.console.backup_sessions_scope')}{' '}
+                {/* Where the bytes GO, which the two sentences above do not say. A
+                    reader can understand the payload exactly and still decline for
+                    want of a destination, so this names the storage and ties it to
+                    the manual button they can already see. The button's own label is
+                    interpolated rather than quoted, so renaming it carries through
+                    here instead of leaving this sentence pointing at nothing. */}
+                {i18nT('apps.awsControl.console.backup_nightly_sessions_destination', {
+                  button: i18nT('apps.awsControl.console.backup_run_now'),
+                })}
+              </div>
+            </div>
+            <Toggle checked={data.nightlySessions === true} onChange={(v) => nightlySessionsMut.mutate(v)} label={i18nT('apps.awsControl.console.backup_nightly_sessions')} />
+          </div>
+          {/* Granted, and not running. Shown only in that combination: with the
+              grant off there is nothing being withheld, and the hint above
+              already says what the switch would do. The switch itself stays
+              interactive and keeps reading back as the owner set it -- their
+              answer is theirs -- while this says the schedule is not producing
+              anything, which is the part they cannot otherwise see until the
+              host is gone. */}
+          {data.nightlySessions === true && data.nightlySessionsBlocked ? (
+            <div className="px-3 pb-2 text-[12px] text-warn" data-testid="backup-nightly-sessions-blocked">
+              {[
+                nightlySessionsBlockedText(data.nightlySessionsBlocked),
+                nightlySessionsBlockedNextText(data.nightlySessionsBlocked),
+              ]
+                .filter(Boolean)
+                .join(' ')}
+            </div>
+          ) : null}
+          {nightlySessionsMut.isError && (
+            <div className="px-3 py-2">
+              <AwsErrorNotice
+                askAgent
+                error={nightlySessionsMut.error}
+                message={i18nT('apps.awsControl.console.backup_nightly_failed', {
+                  setting: i18nT('apps.awsControl.console.backup_nightly_sessions'),
+                })}
+                testId="backup-nightly-sessions-error"
               />
             </div>
           )}
