@@ -49,7 +49,7 @@ _SESSION_MANAGER_PLUGIN_DOC_URL = (
 )
 
 # Valid Unix username shape for the `sudo -u <run_as>` target.
-_USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+_USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\Z")
 
 
 @dataclass

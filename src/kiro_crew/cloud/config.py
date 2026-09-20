@@ -23,7 +23,7 @@ DEFAULT_REGION = "us-east-1"
 # would pass THIS sanitizer but then raise ValidationError on resume (the IAM
 # role name kirocrew-ec2-<tag> maxes at 64), defeating the "just treat it as no
 # last launch" intent. Keep in lockstep with ec2._TAG_RE.
-_TAG_RE = re.compile(r"^[a-zA-Z0-9-]{1,51}$")
+_TAG_RE = re.compile(r"^[a-zA-Z0-9-]{1,51}\Z")
 
 
 @dataclass

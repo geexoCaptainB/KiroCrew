@@ -148,7 +148,7 @@ FINGERPRINT_SCHEME = 1
 #: refused. A tag can be moved after a revision is registered, which leaves the
 #: revision key identifying something other than the image content, and that
 #: identity is the premise every property built on the key depends on.
-_DIGEST_REF_RE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
+_DIGEST_REF_RE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}\Z")
 
 
 @dataclass(frozen=True)
