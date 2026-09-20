@@ -1511,7 +1511,7 @@ re-reads, so:
 session can arrive — a peer's `send_session_bundle` pushing over the tunnel, and
 a person importing an exported file from `ImportSessionItem`. So everything
 that must hold for "a session arrived here" is written in `api_chat_slot_import`
-and nowhere else. One rule lives there.
+and nowhere else. Two rules live there.
 
 **The body is gzip or plain JSON, decided by its own first two bytes.** Not by
 `Content-Type`: `GET .../export` answers `application/gzip`, a browser uploading
@@ -1565,6 +1565,123 @@ document has a syntax error" send a reader to different places. A concatenated
 (multi-member) gzip is refused rather than decoded to its first member: the
 export writes exactly one member, so decoding one and dropping the rest would be
 a truncation nobody asked for.
+
+**The session is filed under `Imported` / `from <sender>`.** The second rule, and
+the reason it lives beside the first: a gzipped file arriving from a person and a
+plain-JSON bundle arriving over the tunnel are the same event carried by different
+transport, so the encoding must decide neither how the bytes are read nor where
+the session lands. `src/kiro_crew/dashboard/arrival_folders.py` owns it; the
+decision record, including why the tunnel's previously-unfiled default was
+changed, is
+[rfc-arrival-provenance-filing.md](../../request-for-change/rfc-arrival-provenance-filing.md).
+
+`<sender>` is the bundle's redacted `origin`. It names a folder and confers
+nothing: `origin` is a field of an untrusted bundle, so it is never read as an
+identity. A bundle with no `origin` is filed under `Imported` directly rather than
+under an invented "from unknown". The names are ASCII English literals, because a
+folder created here is an ordinary sidebar row a person can rename, and a name
+re-derived per render from the active locale would fight that rename.
+
+Four properties make the filing safe to run on an authenticated write route:
+
+- **An app-scoped arrival creates no folder and adopts none**, so it lands
+  unfiled. The folder store has a global ceiling (`MAX_CHAT_FOLDERS`), and an app
+  token that could create a folder per arrival could loop imports with distinct
+  `origin` values until the person is refused a folder of their own. The identity
+  is the caller's, from the shared `effective_request_app` rule — never from the
+  body.
+- **Placement is resolved only after the slot exists**, as the last `await` before
+  the durable save. The handler re-checks the live-slot cap after its own last
+  `await` and can answer `429` there, and a folder written in front of that check
+  is left behind when it fires.
+- **Find-or-create is atomic across both levels**, inside one `mutate_folders`
+  transaction — the shape `ensure_channel_folder` already uses (§ chat folders) —
+  so two arrivals from one peer cannot each create a folder with the same name,
+  and a delete of `Imported` cannot land between the two appends. The lookup
+  compares the name the store WRITES (trimmed and clipped to 100 characters), or a
+  long sender name would miss the clipped row a previous arrival wrote.
+- **Filing is best-effort, and a mid-import delete is repaired.** A ceiling
+  refusal or a store write failure lands the session unfiled rather than failing
+  an import that would otherwise work. The folder is re-checked immediately before
+  the durable save and again after the slot is re-registered in `state._slots`:
+  for the whole finalisation stretch the slot is retracted from that mapping,
+  which is what the folder delete handler's unfile sweep iterates, so without the
+  second check a delete in that window would leave a dangling `folder_id`.
+  The repair writes only while `state._slots` still holds that slot OBJECT. A
+  close landing inside the folder-existence await pops the slot and then persists
+  `closed=True`, so an unguarded repair would write the imported object's
+  `closed=False` over it and resurface the tab the person dismissed; the repair is
+  skipped instead, which leaves a dangling `folder_id` on the archived record —
+  the state the folder delete handler already documents as ignored on the next
+  load. The condition is deliberately the opposite polarity to
+  `chat_handlers._slot_still_ours`, which counts an absent key as still ours
+  because a close pops before its own teardown.
+  Best-effort covers the FOLDER, never the transcript: before the handler reports
+  success, one delete witness runs on EVERY path, and a session deleted while the
+  import was finishing is rolled back with a `409` rather
+  than reported as landed. Two distinct witnesses reach that one refusal. The
+  repair's own save returns a clean `False` — not an exception — when the
+  delete-won guard fires; and because a save reporting success does not imply that
+  guard decided anything (best-effort converts a raising save to success), the
+  import also asks `session_was_deleted` unconditionally afterwards. Without that
+  second, unconditional check the common case is unguarded: a `DELETE` landing in
+  the folder-existence await removes the transcript while the folder it points at
+  is still fine, so the repair branch is skipped entirely and the handler would
+  answer `200 ok` for data that no longer exists. Nothing re-arms after either
+  witness, so reporting the import as landed would be a success no later flush
+  ever corrects.
+- **A failed import takes back the folders it created.** The row is committed
+  before the transcript's durable save, and nothing reclaims an empty chat folder
+  afterwards, so every later failure path passes the ids the filing reports in
+  `ArrivalFiling.created_ids` to `discard_arrival_folders`. Only rows the filing
+  CREATED, never one it adopted: adopting means the person already owned that row.
+  Three guards, the first two inside the one transaction so neither answer can go
+  stale: a row any LIVE slot is filed into is left alone, because a concurrent
+  arrival or a person's move can have filled it; a row whose child survives is
+  left alone, because removing it would orphan that child; and a row carrying the
+  `arrival_adopted` marker is left alone, because a later arrival has filed into
+  it. The marker exists because the live-slot read cannot see an ARCHIVED session
+  — it is popped out of `state._slots` — so a row an archived session is filed
+  into looks unoccupied and has no surviving child. It is written at adoption
+  time, inside the resolving transaction, so the rollback needs no scan of
+  persisted sessions; it is an optional key, the shape `create_folder_record`
+  already uses for `color` and `owner_app`, and it is one-way: a row that has been
+  shared is never reclaimed again, which errs toward leaving an empty row the
+  person can delete rather than removing one somebody is filed into. The ids are walked in reverse
+  (they are recorded parent-first), so the child is taken before its parent and
+  the parent then satisfies the second guard on the same pass. The rollback never
+  raises — the caller is already answering a failure, and a store error here would
+  replace a precise coded refusal with a 500.
+
+  This covers the durable-save `503`, the generic finalisation failure and both
+  `409` refusals. It deliberately does NOT cover
+  cancellation: that arm rolls back synchronously because awaiting inside a
+  cancelled task is not dependable, while the folder store's lock is async. A
+  shutdown or disconnect mid-import can still leave one empty row, which stays
+  recoverable by hand because the row is an ordinary visible folder.
+- **A refusal claims only what it achieved.** The transcript is persisted before
+  the final witness runs, and that witness reports "deleted" for three different
+  situations: the file is gone, the file belongs to a NEW incarnation, and
+  existence is unverifiable. Only the first makes "nothing was kept" true, so the
+  refusal reads the disk once through `session_transcript_remains` and answers
+  `409 transfer_import_deleted` when nothing is left, or
+  `409 transfer_import_deleted_partial` when a transcript remains. The remaining
+  file is deliberately NOT unlinked: a new incarnation belongs to another session,
+  and an unverifiable read names nothing that can safely be removed. That probe
+  fails closed toward "something remains", because the dangerous direction is
+  promising a clean slate that does not exist.
+
+  Its key-scoped unwinding reads the slot table for THREE outcomes, not two,
+  because `dict.get` answers `None` for an absent key exactly as it does for a
+  replaced one. This object still holding the key: pop it, drop the Layer B join
+  and remove the pair. A DIFFERENT object holding it: touch nothing, because the
+  slot, the join and the files are that writer's. No object holding it, which is
+  what the ordinary permanent delete leaves behind: drop the join and remove this
+  import's OWN pair, since nobody else owns it and the delete does not unwind
+  these module-local helpers. The last case is scoped to the sid this import
+  already knows rather than to the sid the join reports, so a mapping a
+  since-popped replacement may have left cannot send the unlink at another
+  session's files.
 
 ### 14.6 Direction and topology
 
