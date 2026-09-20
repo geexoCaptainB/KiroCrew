@@ -16,7 +16,7 @@ import pytest
 
 from kiro_crew.teams.client import TeamsInbound
 from kiro_crew.teams.commands import COMMAND_SPEC, build_help_text, parse_command
-from kiro_crew.teams.transport_dispatch import TeamsDispatcher
+from kiro_crew.teams.transport_dispatch import TeamsDispatcher, _queued_origin
 
 _SVC = "https://smba.trafficmanager.net/teams"
 _EMAIL = "me@example.com"
@@ -312,6 +312,184 @@ class TestDrain:
         assert (
             len(seen) == 1
         ), f"drain re-entered {len(seen)} times; the replay must pass drain=False"
+
+
+class TestDrainIdentity:
+    """A queue shared by two people must not be answered as one person.
+
+    Under ``messaging.dm_scope = "unified"`` every allow-listed person's direct
+    chat collapses into one session key, so ONE queue holds messages from several
+    senders. A combined turn carries ONE envelope, so it may only combine messages
+    that share one.
+    """
+
+    @staticmethod
+    def _from(email: str, conversation: str, activity: str, text: str = "") -> TeamsInbound:
+        return TeamsInbound(
+            conversation_id=conversation,
+            conversation_type="personal",
+            service_url=_SVC,
+            text=text,
+            user_email=email,
+            resolved_identity=email,
+            activity_id=activity,
+        )
+
+    @staticmethod
+    def _patch(monkeypatch) -> tuple[list, list]:
+        """Capture the envelope every replay runs under, and every turn it drives."""
+        envelopes: list[TeamsInbound] = []
+        turns: list = []
+        real_handle = TeamsDispatcher.handle_message
+
+        async def _spy(self, inbound, **kw):
+            envelopes.append(inbound)
+            await real_handle(self, inbound, **kw)
+
+        async def _fake_drive(turn, **kw):
+            turns.append(turn)
+
+        monkeypatch.setattr(TeamsDispatcher, "handle_message", _spy)
+        monkeypatch.setattr("kiro_crew.teams.transport_dispatch.drive_turn", _fake_drive)
+        monkeypatch.setattr(
+            "kiro_crew.teams.transport_dispatch.inbound_permitted", lambda _c: _true()
+        )
+        return envelopes, turns
+
+    @pytest.mark.asyncio
+    async def test_each_queued_message_is_answered_under_its_own_sender(self, monkeypatch) -> None:
+        """Two senders on one queue drain as two turns, each in its own chat.
+
+        End to end through the real enqueue, so the recorder and the reader are
+        covered together: a recorded origin nothing reads back is not a fix.
+        """
+        envelopes, turns = self._patch(monkeypatch)
+        sessions = _Sessions(_Provider())
+        d = _dispatcher(sessions, _Client())
+        key = d._session_key(_EMAIL)
+        first = self._from("first@example.com", "CONV-FIRST", "act-first")
+        second = self._from("second@example.com", "CONV-SECOND", "act-second")
+
+        assert await d._enqueue_with_receipt(key, first, "mine")
+        assert await d._enqueue_with_receipt(key, second, "and mine")
+        # The turn they queued behind has now finished. The fake exposes no setter,
+        # and the drain only runs once the semaphore is released.
+        sessions._busy = False
+
+        await d._drain_queue(key, first)
+
+        assert [e.user_email for e in envelopes] == [
+            "first@example.com",
+            "second@example.com",
+        ], "each drained turn must name the sender who wrote its text"
+        assert [e.text for e in envelopes] == ["mine", "and mine"], "FIFO order, one turn each"
+        assert [e.conversation_id for e in envelopes] == ["CONV-FIRST", "CONV-SECOND"]
+        assert [e.activity_id for e in envelopes] == ["act-first", "act-second"]
+        # The attribution the turn itself is recorded under -- its audit caller and
+        # its session-attribution id both resolve from that envelope.
+        assert [t.audit_caller for t in turns] == [
+            "teams:first@example.com",
+            "teams:second@example.com",
+        ]
+        assert [t.conversation_id for t in turns] == [
+            "teams:first@example.com",
+            "teams:second@example.com",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_one_senders_burst_still_collapses_into_a_single_turn(self, monkeypatch) -> None:
+        """The ordinary case is unchanged: one person's burst is ONE turn."""
+        envelopes, turns = self._patch(monkeypatch)
+        sessions = _Sessions(_Provider())
+        d = _dispatcher(sessions, _Client())
+        key = d._session_key(_EMAIL)
+        sender = self._from(_EMAIL, "CONV", "act-1")
+
+        assert await d._enqueue_with_receipt(key, sender, "first")
+        assert await d._enqueue_with_receipt(key, sender, "second")
+        sessions._busy = False
+
+        await d._drain_queue(key, sender)
+
+        assert [e.text for e in envelopes] == ["first\n\nsecond"], "the burst must still collapse"
+        assert len(turns) == 1
+        assert turns[0].audit_caller == f"teams:{_EMAIL}"
+        assert envelopes[0].conversation_id == "CONV"
+
+    @pytest.mark.asyncio
+    async def test_an_entry_with_no_recorded_origin_uses_the_openers_envelope(
+        self, monkeypatch
+    ) -> None:
+        """An entry written before the origin was recorded still has a reachable reply.
+
+        The whole origin comes from one side or the other. A half-inherited envelope
+        would address one person's chat under another's identity, which is worse
+        than either source alone.
+        """
+        envelopes, _turns = self._patch(monkeypatch)
+        sessions = _Sessions(_Provider(), busy=False)
+        d = _dispatcher(sessions, _Client())
+        key = d._session_key(_EMAIL)
+        sessions.queues[key] = [("1", "legacy", {})]
+        opener = self._from(_EMAIL, "CONV", "act-1")
+
+        await d._drain_queue(key, opener)
+
+        assert [e.text for e in envelopes] == ["legacy"]
+        assert envelopes[0].conversation_id == "CONV"
+        assert envelopes[0].user_email == _EMAIL
+
+    @pytest.mark.asyncio
+    async def test_the_receipt_is_flipped_in_the_chat_that_holds_its_bubble(
+        self, monkeypatch
+    ) -> None:
+        """The bubble belongs to whoever queued first, not to whoever opened the turn."""
+        self._patch(monkeypatch)
+        sessions = _Sessions(_Provider())
+        client = _AddressedClient()
+        d = _dispatcher(sessions, client)
+        key = d._session_key(_EMAIL)
+        queuer = self._from("queuer@example.com", "CONV-QUEUER", "act-q")
+
+        assert await d._enqueue_with_receipt(key, queuer, "held")
+        sessions._busy = False
+
+        await d._drain_queue(key, self._from(_EMAIL, "CONV-OPENER", "act-o"))
+
+        flips = [u for u in client.updates if "Now answering" in u[2]]
+        assert flips, "the drain must flip the receipt"
+        assert flips[0][0] == "CONV-QUEUER", "editing under another chat's address cannot land"
+
+    @pytest.mark.asyncio
+    async def test_the_enqueued_entry_records_the_senders_own_origin(self) -> None:
+        """Nothing downstream can recover an origin the entry never carried."""
+        sessions = _Sessions(_Provider())
+        d = _dispatcher(sessions, _Client())
+        key = d._session_key(_EMAIL)
+        sender = self._from("who@example.com", "CONV-WHO", "act-w")
+
+        assert await d._enqueue_with_receipt(key, sender, "hello")
+
+        # Read back through the production reader rather than by spelling the
+        # storage keys, so renaming one cannot leave this test passing.
+        origin = _queued_origin(sessions.queues[key][0][2], self._from(_EMAIL, "OTHER", "act-o"))
+        assert origin.conversation_id == "CONV-WHO"
+        assert origin.user_email == "who@example.com"
+        assert origin.resolved_identity == "who@example.com"
+        assert origin.activity_id == "act-w"
+        assert origin.service_url == _SVC
+
+
+class _AddressedClient(_Client):
+    """Records the CHAT an edit was addressed to, which ``_Client`` drops."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.updates: list[tuple[str, str, str]] = []  # type: ignore[assignment]
+
+    async def update_message(self, conversation_id, activity_id, content, service_url):
+        self.updates.append((conversation_id, activity_id, content))
+        return True
 
 
 async def _true() -> bool:
