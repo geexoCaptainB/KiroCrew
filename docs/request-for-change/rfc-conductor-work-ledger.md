@@ -297,6 +297,88 @@ events count against the same 200-per-item budget as everything else, which boun
 much peer traffic can push an item's own history off the end — and is a reason the
 per-channel message cap is 50 rather than unbounded.
 
+### Projection of the crew log
+
+The files above are a cache. The record of a board is the crew log: every write the
+two routes accept is appended as one `work/recorded` entry (see
+[`docs/reference/crew-log/session-types.md`](../reference/crew-log/session-types.md))
+to the ACTING session's log -- a conductor action to the conductor's log, a worker
+report to the worker's -- keyed by the conductor's slot, so one board folds under one
+key whichever party wrote it. The entry carries `actor`, `by`, `action` and only the
+fields that action set; an omitted field means "unchanged".
+
+The `work` fold in
+[`src/kiro_crew/crew_log/projection.py`](../../src/kiro_crew/crew_log/projection.py),
+registered in the projection registry beside the session folds, replays those entries
+across the conductor's and its workers' units into the shape the readers already
+consume: the conductor header and every item in creation order, each with its event
+tail. `rebuild_from_projection` in
+[`src/kiro_crew/work_ledger.py`](../../src/kiro_crew/work_ledger.py) re-materialises
+`conductor.json`, `items/*.json` and `items/*.jsonl` from that fold under the same locks
+the writers take, so a lost or damaged cache is recovered from the log rather than from
+a copy of the cache.
+
+Because the log is the record, a write with nowhere to append is refused before the
+cache is touched: with the emitter off the routes answer `409 crew_log_off` (naming
+`KIROCREW_CREW_LOG=1` as the remedy), and a caller whose crew-log unit the session
+registry cannot name answers `409 crew_log_unit_unknown`. A mutation whose entry
+could not fit one log line -- the store takes an acceptance of up to 500 KB, the
+crew log a line of 64 KB -- answers `400 work_entry_too_large`, measured before the
+commit on the widest entry the commit can produce. That line is the effective ceiling
+of every write, and the tool descriptions say so: as JSON a non-ASCII character counts
+six bytes, so a write at every field cap with non-ASCII text can exceed it while each
+field alone passes; a caller sizes a payload to the line, not to the store's record cap. None of these refusals writes a
+byte, so the cache never holds a mutation the log never saw. The store's own
+validation still runs first on every accepted write; the entry is then appended
+with the COMMITTED values (an omitted `artifacts` clears the map, and the entry says
+so) and acknowledged: the route answers `200` only once the writer has appended the
+entry, and otherwise `503 crew_log_unrecorded`, carrying the committed `item_id` so
+a `create` is not repeated on retry. Before answering, the route undoes the unrecorded write from the snapshot it took
+of every file the write could touch (the conductor record, the item's record and
+event log, the worker's binding), and removes an item the write created -- an exact
+undo that needs no fold, so a board from before the projection is undone the same
+way. The cache never keeps a mutation the log never saw. One asyncio lock per board is
+held across a write's commit and its append and across a rebuild, so a rebuild
+cannot fold between the two.
+
+The 64 KB crew-log line is therefore the effective bound on a single write's
+record, and so on an item's `acceptance`, below the store's own 500 KB cap; the
+probe measures the widest entry the commit can produce, so a payload near the line
+is refused a little early rather than a little late.
+
+Items created before a board's first recorded entry -- a board from before this
+change -- are legacy: the record cannot judge them, so a rebuild neither rewrites
+nor removes them, keeps their bindings, and keeps the header fields the record never
+set (a goal set before the first entry, the original creation stamp). Everything
+recorded is rebuilt around them. The first recorded mutation of such an item carries
+the whole committed item as a `baseline`, and the item is then stamped `recorded_at`,
+so from that write on a lost file rebuilds like any other; every entry also carries
+the store's own event id and stamps (`event_id`, `event_ts`, `created_at`,
+`last_report_at`, `closed_at`), so a rebuild reproduces them rather than the append
+time. A rebuild refuses (`409 crew_log_incomplete`) while any crew-log unit's header
+cannot be read: a unit it cannot see might be one of this board's workers, and a fold
+without it would read as complete. It also refuses when the fold holds less than the
+cache does -- an item the log once held whole that no entry names now, a cached
+report later than the fold's latest, more cached events than the fold produced --
+because that is what a unit pruned by retention looks like, and rebuilding from it
+would erase recorded work. When an undo itself fails (an unrecorded write that could
+not be put back, a rebuild that could not be restored) the board is flagged
+`cache_dirty`; every read and write answers `409 cache_dirty` until a rebuild
+completes and clears the flag, so a cache that may disagree with the record is never
+served as if it were the record.
+
+The record's authority to rebuild a board lasts exactly as long as the units that
+hold its entries. The crew log has no retention yet (the base RFC keeps it default-off
+until its deletion and storage promises land, #10705); when retention arrives it must
+keep every unit an open board's entries live in, or checkpoint the fold before removing
+one, otherwise a rebuild after expiry folds only the survivors. That rule belongs to
+retention and is stated here as the dependence this projection has on it.
+
+`bindings/<worker-digest8>.json`, the routing file `work_brief` reads to find the
+worker's board, is reconciled on every rebuild: written for each recorded bind,
+removed when it points at an item the record does not bind to that worker. Channel
+files stay outside the fold; they are a follow-up, not part of the projection change.
+
 ### Tools
 
 Six tools, all mounted on one opt-in MCP server, `kirocrew-work`. Which of them answer a given call depends on what the resolved caller is rather than on which spec mounted them; §Agent spec changes gives the dispatch table and argues for that placement. Four shipped in Phase 2 (`work_brief`, `work_report`, `work_ledger_read`, `work_ledger_record`); `work_request` and `work_message` are Phase 5.

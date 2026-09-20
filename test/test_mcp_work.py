@@ -32,7 +32,13 @@ def test_all_four_tools_are_advertised_to_every_caller():
     missing conductor tools look like a broken install rather than a refusal."""
     names = [t["name"] for t in mcp_work._list_tools()]
     assert names == list(mcp_work.WORK_TOOLS)
-    assert set(names) == {"work_brief", "work_report", "work_ledger_read", "work_ledger_record"}
+    assert set(names) == {
+        "work_brief",
+        "work_report",
+        "work_ledger_read",
+        "work_ledger_record",
+        "work_ledger_rebuild",
+    }
 
 
 def test_every_tool_has_a_registered_schema():
@@ -73,7 +79,11 @@ def test_the_record_tool_advertises_the_seven_actions():
 def test_the_two_halves_are_enumerable_without_parsing_the_definitions():
     """The channel-agent block and the grant tuples both need the names as data."""
     assert mcp_work.WORKER_TOOLS == ("work_brief", "work_report")
-    assert mcp_work.CONDUCTOR_TOOLS == ("work_ledger_read", "work_ledger_record")
+    assert mcp_work.CONDUCTOR_TOOLS == (
+        "work_ledger_read",
+        "work_ledger_rebuild",
+        "work_ledger_record",
+    )
     assert mcp_work.WORK_TOOLS == mcp_work.WORKER_TOOLS + mcp_work.CONDUCTOR_TOOLS
 
 

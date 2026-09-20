@@ -42,12 +42,16 @@ against a binding that exists.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 from typing import Any
 
 from aiohttp import web
 
 from kiro_crew import session_ledger, work_ledger
+from kiro_crew.crew_log import emit as crew_log_emit
+from kiro_crew.crew_log.errors import CrewLogError
+from kiro_crew.crew_log.resolve import UNKNOWN, unit_for_session_key
 from kiro_crew.dashboard import session_control
 from kiro_crew.dashboard.handlers._shared import _is_restricted_session
 
@@ -74,6 +78,8 @@ logger = logging.getLogger(__name__)
 #: fault. The map is asserted exhaustive against the ``CODE_*`` constants by
 #: ``test_work_ledger_tools.py``, so a new code cannot arrive here unnoticed.
 _CODE_STATUS: dict[str, int] = {
+    work_ledger.CODE_CREW_LOG_INCOMPLETE: 409,
+    work_ledger.CODE_CACHE_DIRTY: 409,
     work_ledger.CODE_NO_LEDGER: 404,
     work_ledger.CODE_UNKNOWN_ITEM: 404,
     work_ledger.CODE_ALREADY_BOUND: 409,
@@ -111,6 +117,11 @@ ROUTE_CODES: frozenset[str] = frozenset(
         "invalid_json",
         "invalid_body",
         "ledger_write_failed",
+        "crew_log_off",
+        "crew_log_unit_unknown",
+        "crew_log_unreadable",
+        "crew_log_unrecorded",
+        "work_entry_too_large",
     }
 )
 
@@ -387,6 +398,9 @@ async def api_work_brief(request: web.Request) -> web.Response:
         return brefusal
     assert binding is not None
     conductor_key, item_id = binding
+    dirty = await _refuse_if_dirty(conductor_key, key, "work_brief")
+    if dirty is not None:
+        return dirty
     brief = await asyncio.to_thread(work_ledger.read_work_brief, conductor_key, item_id)
     if _reaches_a_channel(request, request.headers.get("X-Session-Key", "")):
         # Re-checked AFTER the await, immediately before the data would be
@@ -436,6 +450,15 @@ async def api_work_report(request: web.Request) -> web.Response:
         return brefusal
     assert binding is not None
     conductor_key, item_id = binding
+    dirty = await _refuse_if_dirty(conductor_key, key, "work_report")
+    if dirty is not None:
+        return dirty
+
+    state: DashboardState = request.app["state"]
+    unit, urefusal = _acting_unit(state, key, "work_report", item_id)
+    if urefusal is not None:
+        return urefusal
+    assert unit is not None
 
     body, bad = await _json_object(request)
     if bad is not None:
@@ -446,28 +469,274 @@ async def api_work_report(request: web.Request) -> web.Response:
     except ValidationError as exc:
         return _refuse_400(_validation_code(exc), str(exc))
 
-    try:
-        result = await asyncio.to_thread(
-            _report,
-            conductor_key,
-            item_id,
-            cleaned.get("status"),
-            cleaned.get("summary"),
-            cleaned.get("artifacts"),
-            cleaned.get("pr"),
-        )
-    except WorkLedgerError as exc:
-        _audit(key, "work_report", "denied", resources=item_id, error=exc.code)
-        return _refuse_store_error(exc)
-    except OSError:
-        logger.warning("work ledger report failed for %s", item_id, exc_info=True)
-        return _refuse_503("ledger_write_failed", "ledger write failed; try again")
-
-    item = result["item"]
-    _audit(key, "work_report", "ok", resources=f"{item_id} status={item.status}")
-    return web.json_response(
-        {"ok": True, "item_id": item.item_id, "status": item.status, "round": item.round}
+    # The record is refused BEFORE the cache commits: the widest entry this report
+    # can produce (the committed `pr` may be an earlier report's) must fit a line.
+    probe = _work_entry(
+        conductor_key,
+        actor="worker",
+        by=key,
+        action="report",
+        item_id=item_id,
+        round=_WIDEST_COUNTER,
+        status=cleaned.get("status"),
+        summary=cleaned.get("summary"),
+        artifacts=cleaned.get("artifacts") or {},
+        pr=work_ledger.MAX_PR,
+        event=_WIDEST_EVENT_TEXT,
+        event_kind="report",
     )
+    if not crew_log_emit.work_entry_fits(probe):
+        _audit(key, "work_report", "denied", resources=item_id, error="work_entry_too_large")
+        return _refuse_400(
+            "work_entry_too_large",
+            "the report's crew-log record does not fit one log line; shorten it",
+        )
+
+    async def _under_board() -> web.Response:
+        snapshot = await asyncio.to_thread(
+            functools.partial(work_ledger.snapshot_for_write, conductor_key, item_id=item_id)
+        )
+        try:
+            result = await asyncio.to_thread(
+                _report,
+                conductor_key,
+                item_id,
+                cleaned.get("status"),
+                cleaned.get("summary"),
+                cleaned.get("artifacts"),
+                cleaned.get("pr"),
+            )
+        except WorkLedgerError as exc:
+            _audit(key, "work_report", "denied", resources=item_id, error=exc.code)
+            return _refuse_store_error(exc)
+        except OSError:
+            logger.warning("work ledger report failed for %s", item_id, exc_info=True)
+            return _refuse_503("ledger_write_failed", "ledger write failed; try again")
+
+        item = result["item"]
+        board = await asyncio.to_thread(work_ledger.read_conductor, conductor_key)
+        # The entry carries what the COMMIT holds, not what the request said: an
+        # omitted `artifacts` clears the map, and the fold reads an absent field as
+        # unchanged, so only the committed value keeps the rebuild equal to the cache.
+        landed = await asyncio.to_thread(
+            crew_log_emit.on_work_recorded,
+            unit,
+            _entry_with_baseline(
+                conductor_key,
+                item,
+                board,
+                actor="worker",
+                by=key,
+                action="report",
+                item_id=item.item_id,
+                generation=getattr(board, "generation", None) or None,
+                round=item.round,
+                status=item.status,
+                summary=item.summary,
+                artifacts=item.artifacts,
+                pr=item.pr,
+                last_report_at=item.last_report_at,
+                event=getattr(result.get("event"), "text", None),
+                event_kind="report",
+                event_id=getattr(result.get("event"), "id", None) or None,
+                event_ts=getattr(result.get("event"), "ts", None) or None,
+            ),
+        )
+        if not landed:
+            return await _refuse_unrecorded(
+                key, "work_report", item.item_id, conductor_key, snapshot
+            )
+        await asyncio.to_thread(_mark_recorded, conductor_key, item.item_id)
+        _audit(key, "work_report", "ok", resources=f"{item_id} status={item.status}")
+        return web.json_response(
+            {"ok": True, "item_id": item.item_id, "status": item.status, "round": item.round}
+        )
+
+    async with _board_lock(conductor_key):
+        return await _under_board()
+
+
+# The widest values the store can commit for the fields it generates, so a fit
+# probe built before the commit is never narrower than the entry written after it.
+# Event text is capped in characters; six bytes is the widest one can serialize as.
+_WIDEST_COUNTER = 2**31 - 1
+_WIDEST_ITEM_ID = "it_ffffffff"
+_WIDEST_EVENT_TEXT = "W" * (6 * work_ledger.MAX_EVENT_TEXT_CHARS)
+
+
+def _mark_recorded(slot: str, item_id: str) -> None:
+    """Stamp the item as held whole by the log; a failure only costs one more baseline."""
+    try:
+        work_ledger.mark_item_recorded(slot, item_id)
+    except (WorkLedgerError, OSError):
+        logger.debug("work ledger: could not mark %s recorded", item_id, exc_info=True)
+
+
+def _entry_with_baseline(slot: str, item: Any, header: Any, **fields: Any) -> dict[str, Any]:
+    """A ``work/recorded`` payload: the action's fields over a baseline when one is due."""
+    baseline = _baseline_fields(item, header) if item is not None else {}
+    return _work_entry(slot, **{**baseline, **fields})
+
+
+def _baseline_fields(item: Any, header: Any) -> dict[str, Any]:
+    """The whole committed item, for an entry about an item the record never held.
+
+    An item from before the projection (or whose recorded create was undone) has
+    no create entry, so a delta about it could never rebuild it. Until the log has
+    held it whole once (`recorded_at`), every entry about it carries all of it.
+    """
+    if getattr(item, "recorded_at", ""):
+        return {}
+    return {
+        "baseline": True,
+        # The board's own lineage and goal ride along: a nested board whose
+        # header the record never saw would otherwise rebuild as a top-level one.
+        "depth": getattr(header, "depth", 0),
+        "parent_item": getattr(header, "parent_item", None) or None,
+        "goal": getattr(header, "goal", "") or None,
+        "title": item.title,
+        "acceptance": item.acceptance,
+        "state": item.state,
+        "verdict": item.verdict,
+        "decision": item.decision or None,
+        "worker_session_key": item.worker_session_key or None,
+        "round": item.round,
+        "fails": item.fails,
+        "status": item.status,
+        "summary": item.summary or None,
+        "artifacts": item.artifacts,
+        "pr": item.pr,
+        "created_at": item.created_at or None,
+    }
+
+
+#: The item fields each conductor action commits, logged from the committed item.
+#: Mirrors the fold's ``_WORK_CONDUCTOR_FIELDS``: what one writes, the other reads.
+_CONDUCTOR_ACTION_FIELDS: dict[str, tuple[str, ...]] = {
+    "create": ("title", "acceptance", "round"),
+    "bind": ("worker_session_key",),
+    "decide": ("decision", "round"),
+    "verdict": ("verdict", "fails"),
+    "close": ("state", "decision"),
+    "accept": ("acceptance",),
+}
+
+
+#: One asyncio lock per board, held across a write's commit and its crew-log
+#: append and across a rebuild, so a rebuild can never fold between the two and
+#: write the cache back to before a mutation the log then records. Every writer
+#: and every rebuild runs on this gateway's one loop, which is what makes an
+#: in-process lock the complete answer.
+_BOARD_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _board_lock(slot: str) -> asyncio.Lock:
+    lock = _BOARD_LOCKS.get(slot)
+    if lock is None:
+        lock = _BOARD_LOCKS[slot] = asyncio.Lock()
+    return lock
+
+
+async def _refuse_if_dirty(slot: str, key: str, operation: str) -> web.Response | None:
+    """409 while the board's cache is flagged dirty: only a rebuild may touch it.
+
+    The flag is set when an undo failed, so the cache may hold a mutation the
+    record never saw or half of a rebuild. Serving or writing over that would
+    pass the damage on; the refusal names the cure.
+    """
+    reason = await asyncio.to_thread(work_ledger.cache_dirty, slot)
+    if reason is None:
+        return None
+    _audit(key, operation, "denied", error=work_ledger.CODE_CACHE_DIRTY)
+    return _refuse_409(
+        work_ledger.CODE_CACHE_DIRTY,
+        f"the board's cache is flagged dirty ({reason}); run work_ledger_rebuild first",
+    )
+
+
+async def _refuse_unrecorded(
+    key: str,
+    operation: str,
+    item_id: str | None,
+    slot: str,
+    snapshot: dict[str, bytes | None],
+    *,
+    created: str | None = None,
+) -> web.Response:
+    """The store committed but the crew log did not confirm the entry.
+
+    The log is the record, so the cache must not keep a mutation the log never
+    saw: every file the write touched is put back from the *snapshot* the route
+    took before the write, and an item the write created is removed. That undo
+    needs no fold, so it is exact for a board from before the projection as much
+    as for a fresh one; it runs off the loop and under the board lock the caller
+    holds. When even that fails the refusal stands and a rebuild converges.
+    Answered as a failure so the caller never believes the mutation is recorded;
+    the committed `item_id` is returned so a `create` is not repeated on retry.
+    """
+    logger.error("work ledger %s for %s committed without a crew-log record", operation, key)
+    _audit(key, operation, "error", resources=item_id or "", error="crew_log_unrecorded")
+    try:
+        await asyncio.to_thread(
+            functools.partial(work_ledger.restore_snapshot, slot, snapshot, created_item=created)
+        )
+    except Exception:  # noqa: BLE001 - the refusal is the answer either way
+        logger.warning("could not undo the unrecorded write on %s", slot, exc_info=True)
+        try:
+            await asyncio.to_thread(
+                work_ledger.mark_cache_dirty, slot, "an unrecorded write could not be undone"
+            )
+        except Exception:  # noqa: BLE001 - nothing left to do but say so
+            logger.error("could not flag the cache dirty for %s", slot, exc_info=True)
+    return web.json_response(
+        {
+            "ok": False,
+            "error": "the write was stored but its crew-log record was not confirmed",
+            "code": "crew_log_unrecorded",
+            "item_id": item_id,
+        },
+        status=503,
+    )
+
+
+def _work_entry(slot: str, **fields: Any) -> dict[str, Any]:
+    """One ``work/recorded`` payload: the board's slot plus the fields this write set.
+
+    ``None`` values are dropped, because an omitted field means "unchanged" to
+    every reader of the entry, and the type's own validation would refuse a null.
+    """
+    payload: dict[str, Any] = {"slot": slot}
+    payload.update({name: value for name, value in fields.items() if value is not None})
+    return payload
+
+
+def _acting_unit(
+    state: DashboardState, key: str, operation: str, resources: str
+) -> tuple[str | None, web.Response | None]:
+    """The crew-log unit *key* is serving, or the refusal that stops the write.
+
+    The work ledger is a projection of the crew log: every write appends one
+    ``work/recorded`` entry to the acting session's log, and the store files are
+    only a cache rebuilt from those entries. A write with nowhere to append is
+    therefore refused up front -- with the emitter off, or with a caller whose
+    unit the registry cannot name -- rather than leaving the cache holding a
+    mutation the log never saw.
+    """
+    if not crew_log_emit.enabled():
+        _audit(key, operation, "denied", resources=resources, error="crew_log_off")
+        return None, _refuse_409(
+            "crew_log_off",
+            "the crew log is off and the work ledger records only into it; "
+            f"start the gateway with {crew_log_emit.CREW_LOG_ENV}=1",
+        )
+    unit = unit_for_session_key(getattr(state, "sessions", None), key)
+    if not unit or unit == UNKNOWN:
+        _audit(key, operation, "denied", resources=resources, error="crew_log_unit_unknown")
+        return None, _refuse_409(
+            "crew_log_unit_unknown",
+            "this session's crew log unit is not known; there is nothing to record into",
+        )
+    return unit, None
 
 
 def _report(
@@ -512,6 +781,9 @@ async def api_work_ledger_get(request: web.Request) -> web.Response:
     record, lrefusal = await _own_ledger(key, "work_ledger_read")
     if lrefusal is not None:
         return lrefusal
+    dirty = await _refuse_if_dirty(key, key, "work_ledger_read")
+    if dirty is not None:
+        return dirty
     assert record is not None
 
     state: DashboardState = request.app["state"]
@@ -642,43 +914,197 @@ async def api_work_ledger_record(request: web.Request) -> web.Response:
             f"unknown action {action!r}; expected one of: {', '.join(sorted(RECORD_ACTIONS))}",
         )
 
+    state: DashboardState = request.app["state"]
+    unit, urefusal = _acting_unit(state, key, "work_ledger_record", action)
+    if urefusal is not None:
+        return urefusal
+    dirty = await _refuse_if_dirty(key, key, "work_ledger_record")
+    if dirty is not None:
+        return dirty
+    assert unit is not None
+
     if action == "bind":
         refusal = _refuse_unowned_worker(request, key, cleaned.get("worker_session_key"))
         if refusal is not None:
             return refusal
 
-    if action in ("goal", "create"):
-        bootstrapped = await _bootstrap(key)
-        if isinstance(bootstrapped, web.Response):
-            return bootstrapped
-    else:
-        _record, lrefusal = await _own_ledger(key, "work_ledger_record")
-        if lrefusal is not None:
-            return lrefusal
+    # Refused BEFORE the ledger is even bootstrapped: the widest entry this action
+    # can produce,
+    # with the store-generated fields at their widest, must fit one log line. The
+    # request's acceptance IS the committed one (the store keeps it verbatim).
+    probe = _work_entry(
+        key,
+        actor="conductor",
+        by=key,
+        action=action,
+        item_id=cleaned.get("item_id") or _WIDEST_ITEM_ID,
+        goal=cleaned.get("goal"),
+        round=_WIDEST_COUNTER,
+        depth=work_ledger.MAX_DEPTH,
+        parent_item=_WIDEST_ITEM_ID,
+        title=cleaned.get("title"),
+        acceptance=cleaned.get("acceptance"),
+        worker_session_key=cleaned.get("worker_session_key"),
+        decision=cleaned.get("decision"),
+        verdict=cleaned.get("verdict"),
+        state="abandoned",
+        fails=_WIDEST_COUNTER,
+        event=_WIDEST_EVENT_TEXT,
+        event_kind="decision",
+    )
+    if not crew_log_emit.work_entry_fits(probe):
+        _audit(key, "work_ledger_record", "denied", resources=action, error="work_entry_too_large")
+        return _refuse_400(
+            "work_entry_too_large",
+            "the action's crew-log record does not fit one log line; shorten it",
+        )
 
+    async def _under_board() -> web.Response:
+        # The worker key is folded through ``session_ledger.ledger_key`` before the
+        # store writes the binding (see the module note); the snapshot names the
+        # same path, or a failed bind's binding would escape the undo.
+        raw_worker = cleaned.get("worker_session_key")
+        folded_worker = (
+            session_ledger.ledger_key(raw_worker)
+            if isinstance(raw_worker, str) and raw_worker
+            else None
+        )
+        snapshot = await asyncio.to_thread(
+            functools.partial(
+                work_ledger.snapshot_for_write,
+                key,
+                item_id=cleaned.get("item_id"),
+                worker_session_key=folded_worker,
+            )
+        )
+        if action in ("goal", "create"):
+            bootstrapped = await _bootstrap(key)
+            if isinstance(bootstrapped, web.Response):
+                return bootstrapped
+        else:
+            _record, lrefusal = await _own_ledger(key, "work_ledger_record")
+            if lrefusal is not None:
+                return lrefusal
+
+        try:
+            result = await asyncio.to_thread(_write, key, action, cleaned)
+        except WorkLedgerError as exc:
+            _audit(key, "work_ledger_record", "denied", resources=action, error=exc.code)
+            return _refuse_store_error(exc)
+        except OSError:
+            logger.warning("work ledger write failed for %s", key, exc_info=True)
+            return _refuse_503("ledger_write_failed", "ledger write failed; try again")
+
+        item = result.get("item")
+        header = result.get("conductor")
+        event = result.get("event")
+        holder = item if item is not None else header
+        # Each field comes from the COMMITTED record (item or header), never from the
+        # request, so the fold rebuilds what the cache holds; each action logs the
+        # fields it sets -- the same table the fold applies (`_WORK_CONDUCTOR_FIELDS`).
+        sets = _CONDUCTOR_ACTION_FIELDS.get(action, ())
+        landed = await asyncio.to_thread(
+            crew_log_emit.on_work_recorded,
+            unit,
+            _entry_with_baseline(
+                key,
+                item if action != "create" else None,
+                header,
+                actor="conductor",
+                by=key,
+                action=action,
+                item_id=getattr(item, "item_id", None),
+                generation=getattr(header, "generation", None) or None,
+                goal=getattr(header, "goal", None) if action == "goal" else None,
+                round=(
+                    getattr(holder, "round", None) if action == "goal" or "round" in sets else None
+                ),
+                # Lineage is board identity, not an action's delta: every conductor
+                # entry carries it, so a board whose goal was never recorded, or
+                # whose header is lost, still rebuilds at its depth.
+                depth=getattr(header, "depth", None),
+                parent_item=getattr(header, "parent_item", None),
+                title=getattr(item, "title", None) if "title" in sets else None,
+                acceptance=getattr(item, "acceptance", None) if "acceptance" in sets else None,
+                worker_session_key=(
+                    getattr(item, "worker_session_key", None)
+                    if "worker_session_key" in sets
+                    else None
+                ),
+                decision=getattr(item, "decision", None) if "decision" in sets else None,
+                verdict=getattr(item, "verdict", None) if "verdict" in sets else None,
+                state=getattr(item, "state", None) if "state" in sets else None,
+                fails=getattr(item, "fails", None) if "fails" in sets else None,
+                event=getattr(event, "text", None),
+                event_kind=getattr(event, "kind", None),
+                event_id=getattr(event, "id", None) or None,
+                event_ts=getattr(event, "ts", None) or None,
+                created_at=getattr(item, "created_at", None) if action == "create" else None,
+                closed_at=getattr(item, "closed_at", None) if action == "close" else None,
+            ),
+        )
+        if not landed:
+            return await _refuse_unrecorded(
+                key,
+                "work_ledger_record",
+                getattr(item, "item_id", None),
+                key,
+                snapshot,
+                created=getattr(item, "item_id", None) if action == "create" else None,
+            )
+        if item is not None:
+            await asyncio.to_thread(_mark_recorded, key, item.item_id)
+        _audit(
+            key,
+            "work_ledger_record",
+            "ok",
+            resources=f"{action} {getattr(item, 'item_id', '') or ''}".strip(),
+        )
+        payload: dict[str, Any] = {"ok": True, "action": action}
+        if item is not None:
+            payload["item"] = item.to_dict()
+        conductor = result.get("conductor")
+        if conductor is not None:
+            payload["conductor"] = conductor.to_dict()
+        return web.json_response(payload)
+
+    async with _board_lock(key):
+        return await _under_board()
+
+
+async def api_work_ledger_rebuild(request: web.Request) -> web.Response:
+    """POST /api/work-ledger/rebuild -- re-materialise this conductor's board.
+
+    The cache under ``work-ledger/<conductor>/`` is rewritten from the crew log's
+    ``work`` fold over this session's own slot, so a board whose files were lost
+    or damaged comes back from the record. The caller can only rebuild its own
+    board: the slot is the caller's key, never a parameter.
+    """
+    key, refusal = await _caller_key(request, "work_ledger_rebuild")
+    if refusal is not None:
+        return refusal
+    assert key is not None
+    if not crew_log_emit.enabled():
+        _audit(key, "work_ledger_rebuild", "denied", error="crew_log_off")
+        return _refuse_409(
+            "crew_log_off",
+            "the crew log is off, so there is no record to rebuild from; "
+            f"start the gateway with {crew_log_emit.CREW_LOG_ENV}=1",
+        )
     try:
-        result = await asyncio.to_thread(_write, key, action, cleaned)
+        async with _board_lock(key):
+            counts = await asyncio.to_thread(work_ledger.rebuild_from_projection, key)
+    except CrewLogError as exc:
+        _audit(key, "work_ledger_rebuild", "denied", error="crew_log_unreadable")
+        return _refuse_409("crew_log_unreadable", f"the crew log could not be read: {exc}")
     except WorkLedgerError as exc:
-        _audit(key, "work_ledger_record", "denied", resources=action, error=exc.code)
+        _audit(key, "work_ledger_rebuild", "denied", error=exc.code)
         return _refuse_store_error(exc)
     except OSError:
-        logger.warning("work ledger write failed for %s", key, exc_info=True)
+        logger.warning("work ledger rebuild failed for %s", key, exc_info=True)
         return _refuse_503("ledger_write_failed", "ledger write failed; try again")
-
-    item = result.get("item")
-    _audit(
-        key,
-        "work_ledger_record",
-        "ok",
-        resources=f"{action} {getattr(item, 'item_id', '') or ''}".strip(),
-    )
-    payload: dict[str, Any] = {"ok": True, "action": action}
-    if item is not None:
-        payload["item"] = item.to_dict()
-    conductor = result.get("conductor")
-    if conductor is not None:
-        payload["conductor"] = conductor.to_dict()
-    return web.json_response(payload)
+    _audit(key, "work_ledger_rebuild", "ok", resources=f"items={counts['items']}")
+    return web.json_response({"ok": True, **counts})
 
 
 def _has_binding(worker_key: str) -> bool:

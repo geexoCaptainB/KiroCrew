@@ -574,6 +574,21 @@ def unit_header_slot(kind: str, unit_id: str) -> "str | None":
     return slot if isinstance(slot, str) and slot else None
 
 
+def unprovable_session_units() -> int:
+    """How many session-kind units under the root have a header that cannot be proved.
+
+    A slot-keyed fold reaches its units through their headers, so a unit this
+    cannot read is a unit no fold will see; a caller that must know its fold was
+    complete asks this first.
+    """
+    try:
+        root = _checked_crew_log_root(KIND_SESSION)
+        names = sorted(child.name for child in root.iterdir())
+    except (CrewLogError, OSError):
+        return 0
+    return sum(1 for name in names if _proved_header(root / name) is None)
+
+
 #: The cached slot map, the root identity it was built from, and the children that
 #: scan could NOT prove. Replaced WHOLE, so a reader loads one reference and sees
 #: either the old triple or the new one; two threads racing rebuild it twice, which
