@@ -10619,7 +10619,15 @@ class TestBothScopeLanesTolerateAnIndentedVerdictHeader:
             stripped = line.strip()
             if stripped.startswith("#"):
                 continue
-            if "grep -iE" in stripped and "Scope-Verdict:" in stripped:
+            # Case-insensitively, because the capture is: an expression that
+            # lowercases the line before comparing spells the header in lower
+            # case, and a selector keyed to one casing would skip it.
+            if "scope-verdict:" not in stripped.lower():
+                continue
+            # The ASSIGNMENT, named by shape rather than by the program it runs:
+            # a pin keyed to one tool silently stops finding the capture the day
+            # the capture changes tool, and then measures nothing.
+            if '="$(' in stripped:
                 return stripped
         raise AssertionError(f"{workflow}: no Scope-Verdict capture expression")
 
@@ -10631,7 +10639,10 @@ class TestBothScopeLanesTolerateAnIndentedVerdictHeader:
         assert any(line != line.lstrip() for line in header), header
 
     @pytest.mark.parametrize("workflow", _SCOPE_LANES)
-    @pytest.mark.parametrize("indent", ("", "    ", "\t"))
+    # Every whitespace form `[[:space:]]` matches inside a line, because the
+    # capture's own class has to match it: a narrower one silently stops reading
+    # a header the contract's own indentation could produce.
+    @pytest.mark.parametrize("indent", ("", "    ", "\t", "\v", "\f", "\r"))
     def test_each_lane_reads_the_same_verdict_however_it_is_indented(
         self, workflow: str, indent: str, tmp_path: Path
     ) -> None:
@@ -10658,12 +10669,15 @@ class TestBothScopeLanesTolerateAnIndentedVerdictHeader:
                 f'printf %s "${name}"',
             ]
         )
-        # No `bash -e`: the lane's step runs `set -uo pipefail` and nothing else, so
-        # a grep that matches nothing leaves the capture EMPTY and the lane carries
-        # on to read `UNKNOWN`. Running this under `-e` would abort at the failed
-        # assignment and hide which verdict the expression actually yields.
+        # `-e` IS the production flag, and running without it is what let this pin
+        # pass while the lane aborted. A `run:` block with no `shell:` key gets
+        # `bash -e {0}`, which the lane's own job log records, so an expression
+        # whose status is non-zero dies at the assignment -- above whatever
+        # fallback was written for it. Asserting the STATUS as well as the value
+        # is the half that catches that: a capture may legitimately come back
+        # empty, and must never take the step down on its way.
         out = subprocess.run(
-            [bash, "-c", script],
+            [bash, "-e", "-c", script],
             check=False,
             capture_output=True,
             text=True,
@@ -10671,9 +10685,87 @@ class TestBothScopeLanesTolerateAnIndentedVerdictHeader:
             env={**os.environ, "IN": str(review)},
             cwd=tmp_path,
         )
+        assert out.returncode == 0, (
+            f"{workflow}: indent {indent!r} aborted the step (rc={out.returncode}) "
+            f"under the runner's own `bash -e`: {out.stderr.strip()}"
+        )
         assert out.stdout == "PASS", (
             f"{workflow}: indent {indent!r} captured {out.stdout!r} "
             f"(rc={out.returncode}) {out.stderr.strip()}"
+        )
+
+    #: How many ``Scope-Verdict:`` lines the many-headers review carries. Chosen
+    #: well above the smallest count that makes a ``grep | head -n1`` pipeline
+    #: close the pipe on its producer (measured between 200 and 500 on Linux), and
+    #: small enough that the fixture is tens of kilobytes rather than megabytes.
+    _MANY_HEADERS = 2000
+
+    #: Reviews whose header the capture cannot return, and the value each must
+    #: yield. Every one is an ordinary model outcome, and in every one the
+    #: capture's own exit status decides whether the step lives to read its
+    #: fallback. ``many-headers`` is the case where a value IS in hand when the
+    #: read ends early, so an expression that merely suppresses the status would
+    #: hand the lane a verdict it never finished reading.
+    _NO_VERDICT_REVIEWS = {
+        "no-header": ("The change refuses nothing new.\n\nNo header here.\n", ""),
+        "header-shaped-prose": ("I would write Scope-Verdict as a header if asked.\n", ""),
+        "many-headers": (None, "PASS"),
+    }
+
+    @pytest.mark.parametrize("workflow", _SCOPE_LANES)
+    @pytest.mark.parametrize("review_kind", sorted(_NO_VERDICT_REVIEWS))
+    def test_a_capture_that_returns_no_verdict_still_leaves_the_step_alive(
+        self, workflow: str, review_kind: str, tmp_path: Path
+    ) -> None:
+        """An empty capture is an ANSWER, and must not be an abort.
+
+        Each lane keeps a fallback one line under its capture -- ``UNKNOWN`` for the
+        same-repo lane, a ``[ -n ]`` test for the fork lane -- so a review that names
+        no verdict has a defined, fail-closed outcome. A ``run:`` block with no
+        ``shell:`` key runs under ``bash -e``, and these steps add ``pipefail``, so a
+        capture whose status is non-zero dies ABOVE that fallback: the lane writes no
+        verdict output at all, its status step reads an empty verdict, and the comment
+        that would have named the cause is never posted. A red either way, but one of
+        them tells nobody why.
+
+        The status assertion is the whole point. Asserting only the value passes an
+        expression that returns the right value and takes the step down anyway.
+        """
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the capture is Bash; skip where Bash is absent")
+        body, expected = self._NO_VERDICT_REVIEWS[review_kind]
+        if body is None:
+            body = "Scope-Verdict: PASS\n" + "Scope-Verdict: BLOCK\n" * self._MANY_HEADERS
+        review = tmp_path / "scope-review.md"
+        review.write_text(body, encoding="utf-8")
+        line = self._capture_line(workflow)
+        name = line.split("=", 1)[0]
+        script = "\n".join(
+            [
+                "set -uo pipefail",
+                'summary="$(cat "$IN")"',
+                'OUT="$IN"',
+                line,
+                f'printf %s "${name}"',
+            ]
+        )
+        out = subprocess.run(
+            [bash, "-e", "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env={**os.environ, "IN": str(review)},
+            cwd=tmp_path,
+        )
+        assert out.returncode == 0, (
+            f"{workflow}: a {review_kind} review aborted the step "
+            f"(rc={out.returncode}) under the runner's own `bash -e`, above the "
+            f"fallback written for it: {out.stderr.strip()}"
+        )
+        assert out.stdout == expected, (
+            f"{workflow}: a {review_kind} review captured {out.stdout!r}, " f"expected {expected!r}"
         )
 
 

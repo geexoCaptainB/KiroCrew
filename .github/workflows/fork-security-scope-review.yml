@@ -632,7 +632,17 @@ jobs:
             # contract's own indentation would miss an anchored `^Scope-Verdict:`,
             # leave `verdict=UNKNOWN`, and take the `*)` branch below -- a failure
             # conclusion on a clean, fully-adjudicated fork pull request.
-            v="$(grep -iE '^[[:space:]]*Scope-Verdict:' "$OUT" | head -n1 | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr '[:lower:]' '[:upper:]')"
+            # ONE awk over the file, not a pipeline: a `grep` that matches nothing
+            # exits 1, and a `head -n1` closes the pipe on a long review so its
+            # producer dies of SIGPIPE with 141 -- and under this step's `pipefail`
+            # plus the runner's own `-e` either status aborts the step before
+            # `verdict` is ever read. awk exits 0 whether or not the header is
+            # there, so the `[ -n ]` test below decides, exactly as the comment
+            # above describes. The whole file is read and the FIRST header printed
+            # from `END`, never taken from a partial read, and the class spells out
+            # the five characters `[[:space:]]` matches inside a record so nothing
+            # depends on the runners' mawk supporting a POSIX class.
+            v="$(awk '!found && tolower($0) ~ /^[ \t\v\f\r]*scope-verdict:/ { sub(/^[^:]*:[ \t\v\f\r]*/, ""); gsub(/\r/, ""); value = toupper($0); found = 1 } END { if (found) print value }' "$OUT")"
             [ -n "$v" ] && verdict="$v"
           fi
           echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
