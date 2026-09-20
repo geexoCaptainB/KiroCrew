@@ -1022,6 +1022,11 @@ export interface RemoteCrewCapabilities {
 }
 
 export interface ChatSlot {
+  /** Which namespace `agent` was chosen in: a configured member, a shared
+   *  provider template, or "" when the choice was made by name alone or came
+   *  back from history. Display provenance for the picker's selected row; the
+   *  backend never reads it as authority. */
+  agent_kind?: 'member' | 'template' | ''
   /** The agent that will actually answer, when it is NOT the requested `agent`;
    *  "" / absent means nothing to report. The backend stores `agent` verbatim
    *  (the user's intent) and reports the divergence here instead of rewriting it,

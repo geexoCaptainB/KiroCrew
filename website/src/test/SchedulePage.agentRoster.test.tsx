@@ -31,8 +31,8 @@ vi.mock('../api/client', () => ({
     updateCron: vi.fn().mockResolvedValue({}),
     createCron: vi.fn().mockResolvedValue({}),
     defaultAgent: vi.fn().mockResolvedValue({ default_agent: 'kirocrew' }),
-    syncKirocrewAgents: vi.fn().mockResolvedValue({}),
     kirocrewAgents: vi.fn(),
+    agentCatalog: vi.fn(),
   },
 }))
 
@@ -59,8 +59,8 @@ describe('SchedulePage roster failure wiring (#5990)', () => {
     vi.mocked(api).cronHistoryAll.mockResolvedValue({ runs: [] })
     vi.mocked(api).models.mockResolvedValue([])
     vi.mocked(api).defaultAgent.mockResolvedValue({ default_agent: 'kirocrew' })
-    vi.mocked(api).syncKirocrewAgents.mockResolvedValue({})
     vi.mocked(api).kirocrewAgents.mockRejectedValue(new Error('gateway restarting'))
+    vi.mocked(api).agentCatalog.mockRejectedValue(new Error('gateway restarting'))
   })
 
   it('hands the picker a failure it can act on when /api/agents rejects', async () => {
@@ -82,6 +82,8 @@ describe('SchedulePage roster failure wiring (#5990)', () => {
     await waitFor(() => expect(screen.getByText('Retry')).toBeInTheDocument())
 
     vi.mocked(api).kirocrewAgents.mockResolvedValue({ agents: ROSTER, default_agent: 'kirocrew' })
+
+    vi.mocked(api).agentCatalog.mockResolvedValue({ agents: ROSTER, default_agent: 'kirocrew' })
     fireEvent.click(screen.getByText('Retry'))
 
     await waitFor(() => expect(screen.getByText('oncall')).toBeInTheDocument())
@@ -98,6 +100,7 @@ describe('SchedulePage roster failure wiring (#5990)', () => {
 
     const before = store.getState().dashboard.refreshTrigger
     vi.mocked(api).kirocrewAgents.mockResolvedValue({ agents: ROSTER, default_agent: 'kirocrew' })
+    vi.mocked(api).agentCatalog.mockResolvedValue({ agents: ROSTER, default_agent: 'kirocrew' })
     fireEvent.click(screen.getByText('Retry'))
 
     // `useAgents` state is per-instance and the app shell holds its own copy, so

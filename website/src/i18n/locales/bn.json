@@ -5546,10 +5546,13 @@
       "could_not_change_the_default_agent": "ডিফল্ট এজেন্ট বদলানো গেল না",
       "default": "ডিফল্ট",
       "default_agent_for_new_sessions": "নতুন সেশনের ডিফল্ট এজেন্ট",
+      "group_members": "ক্রুমেট",
+      "group_templates": "এজেন্ট টেমপ্লেট",
       "manage_agents": "এজেন্ট পরিচালনা করুন…",
       "new_sessions_start_with_this_agent": "নতুন সেশন এই এজেন্ট দিয়ে শুরু হয়",
       "no_matches": "কোনো মিল নেই",
-      "set_default_agent": "<agent/>-কে নতুন সেশনের ডিফল্ট এজেন্ট করো"
+      "set_default_agent": "<agent/>-কে নতুন সেশনের ডিফল্ট এজেন্ট করো",
+      "group_templates_hint": "শেয়ার করা টেমপ্লেট শেয়ার করা মেমোরিতে চালায়; কাউকে ক্রুমেট হিসেবে নিবন্ধন করা হয় না।"
     },
     "agentImportFlow": {
       "back": "পিছনে",

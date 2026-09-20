@@ -34,6 +34,7 @@ Missing history must never silently turn a private topic into Global memory.
 | `src/kiro_crew/subagent.py` | `_validate_agent` — what an `agent=` name is checked against, and `UNADVERTISED_AGENTS` |
 | `src/kiro_crew/config/prompt-orchestrator.md` | The orchestrator prompt that names `select_crew` and the delegation rule |
 | `src/kiro_crew/dashboard/handlers/agents.py` | Crew CRUD on `/api/agents`, and the roster row serializer |
+| `src/kiro_crew/dashboard/handlers/agent_catalog.py` | Read-only `/api/agents/catalog` execution choices, with separate member and template namespaces |
 | `src/kiro_crew/dashboard/handlers/members.py` | `/api/members` roster, thread get-or-create, rules, activity |
 | `website/src/pages/KiroCrewAgentsPage.tsx` | The Crews UI, mounted as the **Crews** tab of `CapabilitiesPage` (Agent Capabilities) |
 | `website/src/components/crew/crewEditorSections.ts` | The crew editor's pane registry, including the Routing pane that edits `triggers` |
@@ -45,6 +46,50 @@ message only for that status and code together. Other conflicts, including
 memory and template-ownership failures, retain the API error message; missing
 or malformed codes are not guessed to mean a duplicate. Failed creation leaves
 the form open with its entered name and selected template intact.
+
+## Execution-choice catalog
+
+`GET /api/agents/catalog` lists configured members and discovered shared templates
+without enrolling, pruning or allocating a member. Each row carries an explicit
+`selection_kind` (`member` or `template`); a member and template with the same name
+remain separate choices. This projection grants no execution or memory authority.
+Member rows retain the existing roster's field allowlist and redaction rules.
+Template rows expose only name, kind, scope, provider-template name, description
+and source; they do not claim a member memory binding or expose spec paths.
+
+Project discovery uses only the requesting chat's project, selected through
+`X-Session-Key`. An unscoped chat or a request without a chat key never borrows
+another slot's project. An unknown slot and an app request for a foreign slot
+return `404 slot_not_found`. Project templates shadow same-named global templates
+according to discovery's existing execution precedence, not member-name precedence.
+
+Private copies and the runtime's own `kirocrew` / `kirocrew-lite` specs (discovery
+`source == "kirocrew"`, the same rule the sync route applies) are withheld from
+standalone choices; the other shipped specs are ordinary template rows.
+Lineage is read strictly in addition to discovery's optional display enrichment:
+an unreadable lineage file cannot make a private copy appear shared. Discovery,
+config or lineage failure returns `503 agent_catalog_unavailable`, not a partial
+success that looks like an empty catalog. Existing member records remain listed
+when their template is absent, and querying the catalog leaves their configuration
+and memory unchanged. The member-management API (`/api/agents`) and the
+synchronization route (`POST /api/agents/sync`) retain their contracts, but the
+dashboard pickers no longer call sync: `useAgents` reads the catalog, so opening a
+chat, the schedule form or the channel page enrols nothing. The hook returns the
+full typed list as `choices` (the chat agent pop-up renders it grouped under
+**Crewmates** / **Agent templates**, each member row wearing the same avatar the
+roster draws for it, the origin badge dropped because the header already says what
+a row is, and the templates group carrying a one-line hint that a template pick
+runs the shared template on the shared default memory and enrols nothing) and
+the same list folded to one row per name, member first, as `agents` for the
+name-only consumers (cron `agent_id`, channel and project bindings, the cycle
+shortcuts). A pick sends `agent_kind` with the name on slot create and on
+`/api/chat/slots/{slot}/agent`; the slot stores the committed kind, persists it with
+the other slot-owned metadata (`SLOT_OWNED_META_KEYS`, so a restart restores a
+template pick as a template pick and a later name-only pick retracts it) and the list
+projection exposes it, so a same-name member and template are distinct sessions. A
+member DM thread's pin covers the namespace too: the same name picked as a template
+is refused like any other re-bind (`409 member_thread_agent_pinned`).
+Request and error contract: [learn-cron-dashboard](learn-cron-dashboard.md) → Chat.
 
 ## Owner-reviewed capability inheritance
 
@@ -468,6 +513,9 @@ name, and it resolves an empty crew too so the concrete template stays inside
 
 | Test | What it holds |
 |---|---|
+| `test/test_agent_execution_catalog.py` | Read-only catalog, same-name member/template choices, requesting-project isolation, private-template exclusion and explicit discovery failure |
+| `test/test_chat_agent_kind.py` | `agent_kind` on slot create and switch: template picks skip the member store pin, an unresolvable stated kind is `409 agent_choice_unavailable` refused before any slot is minted, an unknown kind is `400 invalid_agent_kind`, a member thread refuses the same-name template kind, the slot projection carries the committed kind |
+| `test/test_open_slots_persistence.py` (`test_restore_carries_the_agent_selection_namespace`) | A template-picked slot restores as a template pick; an unknown persisted kind reads as name-only |
 | `test/test_select_crew.py` | Roster excludes the default crew and every triggerless crew, carries `default_agent` plus guidance; a named crew returns its bindings; an unknown name returns `error` plus `available`; the schema accepts spaces and dots in a crew name |
 | `test/test_crew_reasoning_effort.py` | Per-crew effort reaches a crew dispatch |
 | `test/test_members.py`, `test/test_members_dm_thread.py` | Slug validation and containment, activity recording and dedupe, DM-binding canonicality, rules and briefing reads |

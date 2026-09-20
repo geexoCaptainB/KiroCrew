@@ -5437,10 +5437,13 @@
       "could_not_change_the_default_agent": "デフォルトエージェントを変更できませんでした",
       "default": "デフォルト",
       "default_agent_for_new_sessions": "新しいセッションのデフォルトエージェント",
+      "group_members": "クルーメイト",
+      "group_templates": "エージェントテンプレート",
       "manage_agents": "エージェントを管理…",
       "new_sessions_start_with_this_agent": "新しいセッションはこのエージェントで始まります",
       "no_matches": "マッチするものがありません",
-      "set_default_agent": "<agent/> を新しいセッションのデフォルトエージェントに設定"
+      "set_default_agent": "<agent/> を新しいセッションのデフォルトエージェントに設定",
+      "group_templates_hint": "共有テンプレートを共有メモリで実行します。クルーメイトとして登録されません。"
     },
     "agentImportFlow": {
       "back": "戻る",

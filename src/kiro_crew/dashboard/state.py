@@ -2068,6 +2068,7 @@ class _ChatSlot:
         "key",
         "title",
         "agent",
+        "agent_kind",
         "model",
         "_model_withheld",
         "_model_withheld_for",
@@ -2286,6 +2287,11 @@ class _ChatSlot:
         self.key = key
         self.title = title or key
         self.agent = agent
+        # Which namespace ``agent`` was chosen in: "member" (a configured crew),
+        # "template" (a shared provider template), or "" when the choice was
+        # made by name alone or restored from history. Display provenance for
+        # the picker; never an authorization input.
+        self.agent_kind: str = ""
         # The agent whose ``welcomeMessage`` this slot has already rendered.
         # The hint is a ONE-SHOT per activation: the switch row emits it and
         # the session start that the switch's own reset produces must not emit

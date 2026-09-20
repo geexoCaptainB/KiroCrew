@@ -333,6 +333,8 @@ describe('create-button caret menu', () => {
         // new session. Naming a key here would turn it into an adopt of somebody
         // else's existing session — the two paths differ only by this argument.
         undefined,
+        // `agent_kind`: no agent was named, so no namespace rides with it.
+        undefined,
       ),
     )
   })

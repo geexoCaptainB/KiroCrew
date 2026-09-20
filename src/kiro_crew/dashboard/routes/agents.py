@@ -13,6 +13,7 @@ from __future__ import annotations
 from aiohttp import web
 
 from kiro_crew.dashboard import handlers
+from kiro_crew.dashboard.handlers.agent_catalog import api_agent_catalog
 
 
 def register(app: web.Application) -> None:
@@ -23,6 +24,7 @@ def register(app: web.Application) -> None:
     app.router.add_put("/api/workspaces/{name}", handlers.api_workspaces_update)
     app.router.add_delete("/api/workspaces/{name}", handlers.api_workspaces_delete)
     # Agents
+    app.router.add_get("/api/agents/catalog", api_agent_catalog)
     app.router.add_get("/api/agents/installed", handlers.api_agents_installed)
     app.router.add_get("/api/models", handlers.api_models)
     app.router.add_get("/api/effort-levels", handlers.api_effort_levels)

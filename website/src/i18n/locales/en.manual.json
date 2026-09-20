@@ -2917,9 +2917,12 @@
       "could_not_change_the_default_agent": "Could not change the default agent",
       "default": "Default",
       "default_agent_for_new_sessions": "Default agent for new sessions",
+      "group_members": "Crewmates",
+      "group_templates": "Agent templates",
       "manage_agents": "Manage agents…",
       "new_sessions_start_with_this_agent": "New sessions start with this agent",
-      "set_default_agent": "Set <agent/> as default agent for new sessions"
+      "set_default_agent": "Set <agent/> as default agent for new sessions",
+      "group_templates_hint": "Runs the shared template on shared memory; nothing is enrolled as a crewmate."
     },
     "agentSkillsEditor": {
       "edit_agent_config_to_change_mapping": "{{path}} — edit the agent config file to change this mapping",

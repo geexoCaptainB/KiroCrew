@@ -436,7 +436,11 @@ export default function ChatPane({
   // This pane takes no project prop, so read THIS slot's project from the store:
   // it scopes which project-local agents exist, so a project change must refetch.
   const paneProject = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey)?.project || undefined)
-  const { agents: installedAgents, defaultAgent } = useAgents(agentsRefreshTrigger, slotKey, paneProject)
+  const { agents: installedAgents, choices: catalogChoices, defaultAgent } = useAgents(agentsRefreshTrigger, slotKey, paneProject)
+  // The picker lists every catalog row (a member and a template of one name
+  // are two rows). A roster source that exposes only the folded list -- one
+  // row per name -- is still a complete, if namespace-blind, catalog.
+  const agentChoices = catalogChoices ?? installedAgents
   // One source for every same-meaning marker: the composer chip, the row's
   // check, and the default-agent row's label. An agent-less slot resolves to
   // the configured default (matching what dispatch runs) before the literal
@@ -460,7 +464,9 @@ export default function ChatPane({
       .then(() => dispatch(triggerRefresh()))
       .catch(() => setDefaultAgentFailed(true))
   }, [dispatch])
-  const agentDD = useFilteredDropdown(installedAgents)
+  // The pop-up lists the full catalog (a same-name member and template are
+  // two rows); every other reader of the roster keeps the name-folded list.
+  const agentDD = useFilteredDropdown(agentChoices)
   const localModels = useAvailableModels()
   const effectiveModels = useMemo<ModelInfo[]>(() => {
     if (!paneRemoteCrew.isRemote) return localModels
@@ -538,14 +544,14 @@ export default function ChatPane({
   // thinking block expanding) and turn-collapse shrink re-pin too.
 
 
-  const switchAgent = useCallback(async (name: string) => {
+  const switchAgent = useCallback(async (name: string, kind?: 'member' | 'template') => {
     dispatch(setAgentSwitchNotice(null))
     setSwitchError('')
     try {
       // Same protocol as switchModel below (#4523): the pane must not depend
       // on the coalesced slots rebroadcast to see its own pick.
       // performAgentSlotSwitch mirrors exactly what the response names.
-      await performAgentSlotSwitch(slotKey, name, dispatch)
+      await performAgentSlotSwitch(slotKey, name, dispatch, kind)
     } catch (e) {
       const msg = agentSwitchFailureMessage(e)
       dispatch(setAgentSwitchNotice(msg))
@@ -588,7 +594,7 @@ export default function ChatPane({
     inputRef: agentDD.inputRef,
     hasFilterInput: true,
     filteredCount: agentDD.filtered.length,
-    onEnterSingleMatch: () => { switchAgent(agentDD.filtered[0].name); agentDD.setOpen(false) },
+    onEnterSingleMatch: () => { switchAgent(agentDD.filtered[0].name, agentDD.filtered[0].selection_kind); agentDD.setOpen(false) },
     closeToTrigger: () => agentDD.setOpen(false),
   })
   const { onListKeyDown: onModelListKeyDown } = useListboxKeyboard({
@@ -1688,7 +1694,7 @@ export default function ChatPane({
               />
             </div>
             <div role="listbox" aria-label={i18nT('components.chatPane.agent_list')} className="overflow-y-auto max-h-[280px]">
-              <AgentDropdownList agents={agentDD.filtered} activeAgent={paneAgentName} defaultAgent={defaultAgent} onSelect={(name) => { switchAgent(name); agentDD.setOpen(false) }} />
+              <AgentDropdownList agents={agentDD.filtered} activeAgent={paneAgentName} activeKind={paneSlot?.agent_kind} defaultAgent={defaultAgent} onSelect={(name, kind) => { switchAgent(name, kind); agentDD.setOpen(false) }} />
             </div>
             <DefaultAgentRow agentName={paneAgentName} isDefault={paneAgentName === defaultAgent} onSetDefault={() => toggleDefaultAgent(paneAgentName)} />
             <ManageAgentsFooter error={defaultAgentFailed} onManage={() => { agentDD.setOpen(false); navigate('/capabilities?tab=crews') }} />

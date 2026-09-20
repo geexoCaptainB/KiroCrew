@@ -5546,10 +5546,13 @@
       "could_not_change_the_default_agent": "Der Standardagent konnte nicht geändert werden",
       "default": "Standard",
       "default_agent_for_new_sessions": "Standard-Agent für neue Sitzungen",
+      "group_members": "Crew-Kameraden",
+      "group_templates": "Agent-Vorlagen",
       "manage_agents": "Agenten verwalten…",
       "new_sessions_start_with_this_agent": "Neue Sitzungen starten mit diesem Agenten",
       "no_matches": "Keine Treffer",
-      "set_default_agent": "<agent/> als Standard-Agenten für neue Sitzungen festlegen"
+      "set_default_agent": "<agent/> als Standard-Agenten für neue Sitzungen festlegen",
+      "group_templates_hint": "Führt die geteilte Vorlage mit geteiltem Gedächtnis aus; nichts wird als Crew-Kamerad eingetragen."
     },
     "agentImportFlow": {
       "back": "Zurück",

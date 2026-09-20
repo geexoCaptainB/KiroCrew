@@ -27,6 +27,7 @@ import type {
   WorkflowRunSummary,
 } from '../types'
 import type { RemoteCrewCapabilities } from '../hooks/useRemoteCapabilities'
+import type { KiroCrewAgent } from '../components/AgentSelector'
 import type { MemoryRecord, MemoryRecordRef, MemoryRecordQuery, MemoryRecordSelection, MemoryEditOperation, MemoryEditPreview, MemoryRecordRevision } from '../types/memoryEditing'
 import type { AutoNudgeListResponse } from '../components/autoNudgeLoop'
 import type { TaskDetailResponse, TasksListResponse, TasksSummary } from './tasks'
@@ -3334,7 +3335,16 @@ export const api = {
    *  `agent` resolves the configured default agent. */
   agentResolvedModel: (agent: string) =>
     fetch('/api/agents/resolved-model?agent=' + encodeURIComponent(agent)).then(j),
-  syncKirocrewAgents: () => post('/api/agents/sync', {}).then(j),
+  /** Execution choices for a chat: configured members AND installed shared
+   *  templates, each row tagged with its `selection_kind`. Read-only -- unlike
+   *  the sync route it enrols nothing and allocates no member memory, so
+   *  every picker can call it without side effects. Same `X-Session-Key`
+   *  scoping as `kirocrewAgents`: project templates come from THIS chat's
+   *  project, never from another open pane's. */
+  agentCatalog: (sessionKey?: string) =>
+    fetch('/api/agents/catalog', {
+      headers: sessionKey ? { 'X-Session-Key': sessionKey } : { ..._sk },
+    }).then(j) as Promise<{ agents: KiroCrewAgent[]; default_agent: string }>,
   createKirocrewAgent: (body: object) => post('/api/agents', body).then(j),
   // Crew Members page — roster of GLOBAL crews with DM-thread binding and the
   // cheap live-status fields the backend can answer without IO (richer live
@@ -3424,8 +3434,15 @@ export const api = {
   slashCommands: (signal?: AbortSignal) =>
     withDeadline(SLASH_COMMANDS_TIMEOUT_MS, signal, s =>
       fetch('/api/slash-commands', { signal: s }).then(j)),
-  chatSlotAgent: (slot: string, agent: string) =>
-    post('/api/chat/slots/' + encodeURIComponent(slot) + '/agent', { agent }).then(j) as Promise<{ ok?: boolean; agent?: string; workspace?: string }>,
+  /** `kind` names the namespace the user picked from. Omitted, the backend
+   *  keeps its legacy name-first resolution; stated, a same-name template and
+   *  member are told apart and an unresolvable choice is refused (409) rather
+   *  than answered by the default agent. */
+  chatSlotAgent: (slot: string, agent: string, kind?: 'member' | 'template') =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/agent', {
+      agent,
+      ...(kind ? { agent_kind: kind } : {}),
+    }).then(j) as Promise<{ ok?: boolean; agent?: string; agent_kind?: 'member' | 'template' | ''; workspace?: string }>,
   chatSlotModel: (slot: string, model: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/model', { model }).then(j) as Promise<{ ok?: boolean; model?: string }>,
   /** This slot's auto-compact threshold override (null = follows the global). */
@@ -3953,7 +3970,7 @@ export const api = {
    *  the `remote_already_bound` guard does not fire, and the peer's transcript is
    *  backfilled server-side. Requires `instance_id`; without it the backend
    *  answers `400 adopt_needs_instance`. */
-  createChatSlot: async (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, artifact?: string, folder_id?: string, instance_id?: string, adopt_remote_slot?: string) => {
+  createChatSlot: async (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, artifact?: string, folder_id?: string, instance_id?: string, adopt_remote_slot?: string, agent_kind?: 'member' | 'template') => {
     // ADOPT deliberately resolves NO default memory mode. The adopted slot carries
     // the PEER session's own `memory_mode` — that mode is the privacy boundary and
     // the session it belongs to already chose it — so sending this machine's
@@ -3968,6 +3985,8 @@ export const api = {
     return post('/api/chat/slots', {
       ...(name ? { name } : {}),
       ...(agent ? { agent } : {}),
+      // Only beside an agent: a namespace without a name selects nothing.
+      ...(agent && agent_kind ? { agent_kind } : {}),
       ...(model ? { model } : {}),
       ...(mode ? { mode } : {}),
       ...(resolvedMemoryMode ? { memory_mode: resolvedMemoryMode } : {}),

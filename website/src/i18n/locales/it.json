@@ -5636,10 +5636,13 @@
       "could_not_change_the_default_agent": "Non è stato possibile cambiare l’agente predefinito",
       "default": "Predefinito",
       "default_agent_for_new_sessions": "Agente predefinito per le nuove sessioni",
+      "group_members": "Compagni di equipaggio",
+      "group_templates": "Modelli di agente",
       "manage_agents": "Gestisci gli agenti…",
       "new_sessions_start_with_this_agent": "Le nuove sessioni iniziano con questo agente",
       "no_matches": "Nessuna corrispondenza",
-      "set_default_agent": "Imposta <agent/> come agente predefinito per le nuove sessioni"
+      "set_default_agent": "Imposta <agent/> come agente predefinito per le nuove sessioni",
+      "group_templates_hint": "Esegue il modello condiviso con memoria condivisa; nessun compagno viene registrato."
     },
     "agentImportFlow": {
       "back": "Indietro",

@@ -5546,10 +5546,13 @@
       "could_not_change_the_default_agent": "डिफ़ॉल्ट एजेंट बदला नहीं जा सका",
       "default": "डिफ़ॉल्ट",
       "default_agent_for_new_sessions": "नए सत्रों का डिफ़ॉल्ट एजेंट",
+      "group_members": "क्रूमेट",
+      "group_templates": "एजेंट टेम्पलेट",
       "manage_agents": "एजेंट प्रबंधित करें…",
       "new_sessions_start_with_this_agent": "नए सत्र इस एजेंट के साथ शुरू होते हैं",
       "no_matches": "कोई मेल नहीं",
-      "set_default_agent": "<agent/> को नए सत्रों का डिफ़ॉल्ट एजेंट बनाओ"
+      "set_default_agent": "<agent/> को नए सत्रों का डिफ़ॉल्ट एजेंट बनाओ",
+      "group_templates_hint": "साझा टेम्पलेट को साझा मेमोरी के साथ चलाता है; कोई क्रूमेट नामांकित नहीं होता।"
     },
     "agentImportFlow": {
       "back": "पीछे",

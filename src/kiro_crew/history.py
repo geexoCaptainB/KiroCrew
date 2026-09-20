@@ -185,6 +185,10 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         # rebind would be un-erasable and the session would keep consolidating
         # into the silo it left.
         "memory_store",
+        # The namespace the agent was picked in. Slot-owned for the same reason
+        # as memory_store: a name-only pick after a template pick writes no key,
+        # and an unowned key would carry the stale "template" forward forever.
+        "agent_kind",
         "project",
         # Remote-execution binding: owned by the slot, so clearing it in memory
         # clears it on disk. Left unowned, a rebind or an unbind would be undone

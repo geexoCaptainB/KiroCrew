@@ -5726,10 +5726,13 @@
       "could_not_change_the_default_agent": "Не удалось изменить агента по умолчанию",
       "default": "По умолчанию",
       "default_agent_for_new_sessions": "Агент по умолчанию для новых сессий",
+      "group_members": "Товарищи по команде",
+      "group_templates": "Шаблоны агентов",
       "manage_agents": "Управление агентами…",
       "new_sessions_start_with_this_agent": "Новые сессии начинаются с этим агентом",
       "no_matches": "Нет совпадений",
-      "set_default_agent": "Сделать <agent/> агентом по умолчанию для новых сессий"
+      "set_default_agent": "Сделать <agent/> агентом по умолчанию для новых сессий",
+      "group_templates_hint": "Запускает общий шаблон с общей памятью; никто не добавляется в команду."
     },
     "agentImportFlow": {
       "back": "Назад",

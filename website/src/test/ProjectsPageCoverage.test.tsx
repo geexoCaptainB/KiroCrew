@@ -37,7 +37,7 @@ vi.mock('../api/client', () => ({
   api: {
     taskRunnerStatus: vi.fn(),
     kirocrewAgents: vi.fn(),
-    syncKirocrewAgents: vi.fn().mockResolvedValue({}),
+    agentCatalog: vi.fn(),
     planTask: vi.fn(),
     cancelPlan: vi.fn(),
     executePlan: vi.fn(),
@@ -70,6 +70,7 @@ const mkRun = (overrides: Partial<ProjectRun> = {}): ProjectRun => ({
 function resetApi(runs: ProjectRun[] = []) {
   vi.mocked(api.taskRunnerStatus).mockResolvedValue({ running: false, available: true, runs })
   vi.mocked(api.kirocrewAgents).mockResolvedValue({ agents: [], default_agent: '' })
+  vi.mocked(api.agentCatalog).mockResolvedValue({ agents: [], default_agent: '' })
   vi.mocked(api.refineStatus).mockResolvedValue({ status: 'idle', text: '', error: '' })
   vi.mocked(api.planTask).mockResolvedValue({ ok: true, task_id: 'plan-1' })
   vi.mocked(api.cancelPlan).mockResolvedValue({ ok: true })

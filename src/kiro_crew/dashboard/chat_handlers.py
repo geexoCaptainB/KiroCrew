@@ -2530,6 +2530,15 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
         # path that did not rather than adding a new rule.
         name = str(name)
     agent = body.get("agent", "")
+    # The selection NAMESPACE, when the caller states one. "member" names a
+    # configured crew, "template" a shared provider template; an omitted kind
+    # keeps the legacy name-only resolution. The kind is selection input, never
+    # authority: every owner, app and private-memory gate below still applies.
+    agent_kind = body.get("agent_kind", "")
+    if agent_kind not in ("", "member", "template"):
+        return web.json_response(
+            {"error": "invalid agent kind", "code": "invalid_agent_kind"}, status=400
+        )
     model = body.get("model", "")
     # Folder membership at BIRTH. Assigning it afterwards (client PATCH) is
     # visibly too late: get_or_create_slot broadcasts the new slot before this
@@ -2881,10 +2890,30 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
             else None
         )
         try:
+            # Resolved in the STATED namespace, so a template pick takes the
+            # template's workspace rather than a same-name member's. No project
+            # scope here: a create carries no slot yet, and the catalog offers a
+            # slot-less chat global rows only, so this is the whole choice set.
             bindings = await asyncio.to_thread(
-                resolve_agent_bindings, cfg, agent, validate_memory_files=False
+                resolve_agent_bindings,
+                cfg,
+                agent,
+                validate_memory_files=False,
+                selection_kind=agent_kind,
             )
             workspace = _workspace_name_for_dir(cfg, bindings.workspace_dir)
+            if agent_kind and not bindings.requested_resolved:
+                # A stated namespace never falls back to whoever answers by
+                # default -- and it is refused HERE, before get_or_create_slot,
+                # so a refused create registers no slot. The legacy name-only
+                # path below keeps its store-verbatim-and-log behaviour.
+                return web.json_response(
+                    {
+                        "error": "the selected agent choice is not available",
+                        "code": "agent_choice_unavailable",
+                    },
+                    status=409,
+                )
             if not bindings.requested_resolved:
                 # Log only — the requested binding is the user's intent and is
                 # stored VERBATIM. Rewriting it to whatever currently answers was
@@ -3183,8 +3212,14 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                 await creation_stack.enter_async_context(_slot_switch_session_lock(assignment_key))
                 selection_change = None
                 try:
-                    assigned_store = await pin_private_agent_store(
-                        state, assignment_key, agent, cfg, memory_mode=slot.memory_mode
+                    # An explicit template choice is the shared template even when
+                    # a member carries the same name: it never pins member memory.
+                    assigned_store = (
+                        ""
+                        if agent_kind == "template"
+                        else await pin_private_agent_store(
+                            state, assignment_key, agent, cfg, memory_mode=slot.memory_mode
+                        )
                     )
                     chosen = await asyncio.to_thread(
                         resolve_agent_bindings,
@@ -3192,7 +3227,11 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                         assignment_agent,
                         assignment_project or None,
                         validate_memory_files=False,
+                        selection_kind=agent_kind,
                     )
+                    # Availability was settled before the mint; this records
+                    # the namespace the pick was committed in.
+                    slot.agent_kind = chosen.selection_kind
                     selection_change = await _record_explicit_agent_selection(
                         assignment_key,
                         assignment_agent,
@@ -6648,10 +6687,19 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
     agent_name = body.get("agent", "")
     if agent_name and not _AGENT_NAME_RE.match(agent_name):
         return web.json_response({"error": "invalid agent name"}, status=400)
-    if slot.mode == "member" and agent_name != slot.agent:
+    # Same contract as the create route: an optional namespace for the name.
+    agent_kind = body.get("agent_kind", "")
+    if agent_kind not in ("", "member", "template"):
+        return web.json_response(
+            {"error": "invalid agent kind", "code": "invalid_agent_kind"}, status=400
+        )
+    if slot.mode == "member" and (agent_name != slot.agent or agent_kind == "template"):
         # Member DM threads are pinned to their crew: refuse the switch before
         # any state is touched. A same-name "switch" stays allowed — it is a
-        # session reset, not a re-bind. Audited like every other pin denial
+        # session reset, not a re-bind — but only in the MEMBER namespace: the
+        # same name picked as a template would run the shared template and
+        # detach the thread from the member's memory, which is a re-bind by
+        # another spelling. Audited like every other pin denial
         # (the send path's guard emits the same event), so a probe against the
         # pin is visible in the SEL trail.
         _emit_agent_assignment(slot.key, agent_name, outcome="denied_member_pin")
@@ -6730,6 +6778,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                     agent_name,
                     slot.project or None,
                     validate_memory_files=False,
+                    selection_kind=agent_kind,
                 )
             except Exception as exc:
                 from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
@@ -6870,6 +6919,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                     agent_name,
                     pre_await_project or None,
                     validate_memory_files=False,
+                    selection_kind=agent_kind,
                 )
             else:
                 bindings = await asyncio.to_thread(
@@ -6997,6 +7047,18 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
             raise
         except Exception:
             logger.warning("Failed to resolve agent bindings for %r", agent_name, exc_info=True)
+
+        if agent_kind and not assignment_resolved:
+            # A stated namespace never falls back to whoever answers by default.
+            if slot.agent is committed_agent:
+                slot.agent = prior_agent
+            return web.json_response(
+                {
+                    "error": "the selected agent choice is not available",
+                    "code": "agent_choice_unavailable",
+                },
+                status=409,
+            )
 
         if not assignment_resolved and prior_selection is not None:
             # A failed lookup cannot commit a name while retaining a different
@@ -7390,6 +7452,9 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         if (
             owner_pick
             and agent_name
+            # A shared-template pick has no member memory to grant, even when
+            # a member of the same name exists.
+            and agent_kind != "template"
             and not slot.messages
             and not slot.linked_session_key
             and not slot.channel_origin
@@ -7467,9 +7532,16 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
     # The reset destroyed any eagerly created session; picking an agent is
     # itself a strong first-message intent signal (it also resets the
     # project), so re-arm the speculative spawn for the new bindings.
+    if slot.agent is committed_agent:
+        slot.agent_kind = bindings.selection_kind if assignment_resolved else ""
     schedule_eager_spawn(state, slot)
     state.push_slots_update()
-    resp_body: dict = {"ok": True, "agent": agent_name, "workspace": workspace}
+    resp_body: dict = {
+        "ok": True,
+        "agent": agent_name,
+        "agent_kind": slot.agent_kind,
+        "workspace": workspace,
+    }
     if teardown_incomplete:
         # Advisory only — the switch itself succeeded and the response
         # carries the committed state the acting tab writes optimistically.

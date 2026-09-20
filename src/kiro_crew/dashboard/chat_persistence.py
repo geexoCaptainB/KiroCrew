@@ -1409,6 +1409,11 @@ def _rehydrate_slot_from_history(
             slot.workspace = meta["workspace"]
         if meta.get("memory_store"):
             slot.memory_store = str(meta["memory_store"])
+        # The namespace the agent was picked in survives a restart with the
+        # pick itself: a template-picked slot must not come back lighting the
+        # same-name member row. Only the two known values are honoured.
+        if meta.get("agent_kind") in ("member", "template"):
+            slot.agent_kind = meta["agent_kind"]
         if meta.get("project"):
             slot.project = meta["project"]
         # Restore the remote executor marker INDEPENDENTLY of its target fields.
@@ -2013,6 +2018,8 @@ def _apply_recent_session(
         slot.workspace = meta["workspace"]
     if meta.get("memory_store"):
         slot.memory_store = str(meta["memory_store"])
+    if meta.get("agent_kind") in ("member", "template"):
+        slot.agent_kind = meta["agent_kind"]
     if meta.get("project"):
         slot.project = meta["project"]
     if _member_identity is None and (_mode := _restored_mode(meta.get("mode"))):
@@ -3547,6 +3554,9 @@ def _save_slot_to_history(
                 # falsy as "the global store", which is also how a session written
                 # before crew stores existed reads.
                 fields["memory_store"] = named_store_or_empty(slot.memory_store)
+                # Clearable like memory_store: a name-only pick after a template
+                # pick must not keep advertising the template namespace.
+                fields["agent_kind"] = slot.agent_kind
                 if slot.project:
                     fields["project"] = slot.project
                 if slot._app:
@@ -3920,6 +3930,8 @@ def _save_slot_to_history(
                 meta_line["workspace"] = slot.workspace
             if _named := named_store_or_empty(slot.memory_store):
                 meta_line["memory_store"] = _named
+            if slot.agent_kind:
+                meta_line["agent_kind"] = slot.agent_kind
             if slot.project:
                 meta_line["project"] = slot.project
             # Remote-execution binding. All three are written together or not at

@@ -873,13 +873,19 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // transcripts. So the client must not OFFER them here either — same predicate
   // and same `executor` keying `selectContinuable` already uses for Resume.
   const activeSlotRemoteBound = slotIsRemoteBound(slots.find(s => s.key === activeSlot))
-  const { agents: installedAgents, defaultAgent } = useAgents(refreshTrigger, activeSlot ?? undefined, activeSlotProject)
+  const { agents: installedAgents, choices: catalogChoices, defaultAgent } = useAgents(refreshTrigger, activeSlot ?? undefined, activeSlotProject)
+  // The picker lists every catalog row (a member and a template of one name
+  // are two rows). A roster source that exposes only the folded list -- one
+  // row per name -- is still a complete, if namespace-blind, catalog.
+  const agentChoices = catalogChoices ?? installedAgents
   // Is this session bound to a peer crew for execution, and what does that crew
   // offer? Read once here and threaded into the shelf's pickers below, so every
   // control answers from one source rather than each deciding for itself.
   const remoteCrew = useRemoteCapabilities(slots.find(s => s.key === activeSlot))
   const effectiveAgents = useMemo<KiroCrewAgent[]>(() => {
-    if (!remoteCrew.isRemote) return installedAgents
+    // Local: the full catalog, so a same-name member and template stay two
+    // rows. Remote: the peer's own roster, which knows no namespaces.
+    if (!remoteCrew.isRemote) return agentChoices
     // The peer's roster carries the four fields its picker renders. The rest of
     // KiroCrewAgent describes bindings that only mean something on the machine
     // that owns them (`kiro_agent`, `workspace`, `memory_store`), so they are
@@ -894,7 +900,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       description: a.description,
       source: a.scope || 'remote',
     }))
-  }, [remoteCrew.isRemote, remoteCrew.capabilities, installedAgents])
+  }, [remoteCrew.isRemote, remoteCrew.capabilities, agentChoices])
   const [defaultAgentFailed, setDefaultAgentFailed] = useState(false)
   // Promotes an agent to the global default. Set-only: clearing the default lives on
   // the Agent Templates page, where the control is labelled and the outcome is visible.
@@ -961,7 +967,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     filteredCount: filteredAgents.length,
     onEnterSingleMatch: () => {
       const a = filteredAgents[0]
-      if (a) { switchAgent(a.name); setAgentDropdown(false) }
+      if (a) { switchAgent(a.name, a.selection_kind); setAgentDropdown(false) }
     },
     closeToTrigger: () => setAgentDropdown(false),
   })
@@ -976,7 +982,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   })
   const [pendingAgent, _setPendingAgent] = useState('')  // agent for next new slot
   const pendingAgentRef = useRef('')
-  const setPendingAgent = useCallback((v: string) => { pendingAgentRef.current = v; _setPendingAgent(v) }, [])
+  // The namespace the pending agent was picked from, kept beside the name so
+  // the create carries both: a pending "reviewer" template must not become the
+  // "reviewer" member on send. Cleared with the name.
+  const pendingAgentKindRef = useRef<'member' | 'template' | undefined>(undefined)
+  const setPendingAgent = useCallback((v: string, kind?: 'member' | 'template') => {
+    pendingAgentRef.current = v
+    pendingAgentKindRef.current = v ? kind : undefined
+    _setPendingAgent(v)
+  }, [])
   const [pendingModel, _setPendingModel] = useState('')  // model for next new slot
   const pendingModelRef = useRef('')
   const setPendingModel = useCallback((v: string) => { pendingModelRef.current = v; _setPendingModel(v) }, [])
@@ -2477,7 +2491,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // paste blocks and attachments, surface the failure, and bail.
       let created: { key: string } | null = null
       try {
-        created = await dispatch(createSlot({ agent: pendingAgentRef.current || defaultAgent || undefined, model: pendingModelRef.current || undefined, mode: modeRef.current })).unwrap()
+        created = await dispatch(createSlot({ agent: pendingAgentRef.current || defaultAgent || undefined, agent_kind: pendingAgentRef.current ? pendingAgentKindRef.current : undefined, model: pendingModelRef.current || undefined, mode: modeRef.current })).unwrap()
       } catch (e: unknown) {
         sendingRef.current = false
         if (isolated) {
@@ -2962,9 +2976,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     const n = store.getState().notifications.items.find(x => x.approval_id === aid)
     if (n) dispatch(removeNotificationByTs(n.ts))
   }, [activeSlot, dispatch])
-  const switchAgent = useCallback(async (agentName: string) => {
+  const switchAgent = useCallback(async (agentName: string, kind?: 'member' | 'template') => {
     if (!activeSlot) {
-      setPendingAgent(agentName)
+      setPendingAgent(agentName, kind)
       // Clear any explicit pick made for the PREVIOUS agent rather than
       // re-seeding a resolved model: an empty pendingModel makes createSlot omit
       // `model`, which lets the backend resolve the new agent's own chain at
@@ -2977,7 +2991,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // Same protocol as switchModel below (#4523): the acting tab must not
       // depend on the coalesced slots rebroadcast to see its own pick.
       // performAgentSlotSwitch mirrors exactly what the response names.
-      await performAgentSlotSwitch(activeSlot, agentName, dispatch)
+      await performAgentSlotSwitch(activeSlot, agentName, dispatch, kind)
     } catch (error) {
       // Closing the picker is the call sites' job and already happens
       // synchronously alongside this call, so a failure surfaces as the shared
@@ -6907,7 +6921,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   newSlotMutation.mutate()
                   return
                 }
-                dispatch(createSlot({ agent: pendingAgent || defaultAgent || undefined, model: pendingModel || undefined, mode }))
+                dispatch(createSlot({ agent: pendingAgent || defaultAgent || undefined, agent_kind: pendingAgent ? pendingAgentKindRef.current : undefined, model: pendingModel || undefined, mode }))
               }}
             >
               {i18nT('pages.chatPage.start_a_new_chat')}
@@ -7870,7 +7884,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   <Input ref={agentInputRef} type="text" aria-label={i18nT('pages.chatPage.filter_agents')} placeholder={i18nT('pages.chatPage.type_to_filter')} value={agentFilter} onChange={e => setAgentFilter(e.target.value)} className="w-full px-2 py-1 text-[13px]" />
                 </div>
                 <div role="listbox" aria-label={i18nT('pages.chatPage.agent_list')} className="overflow-y-auto max-h-[280px]">
-                <AgentDropdownList agents={filteredAgents} activeAgent={activeAgentName} defaultAgent={defaultAgent} onSelect={(name) => { switchAgent(name); setAgentDropdown(false) }} filter={agentFilter} />
+                <AgentDropdownList agents={filteredAgents} activeAgent={activeAgentName} activeKind={currentSlot?.agent_kind} defaultAgent={defaultAgent} onSelect={(name, kind) => { switchAgent(name, kind); setAgentDropdown(false) }} filter={agentFilter} />
                 </div>
                 {/* Embedded chat gets neither half of the default-agent affordance: it has
                     no /capabilities route for the footer, and the footer is what carries the
