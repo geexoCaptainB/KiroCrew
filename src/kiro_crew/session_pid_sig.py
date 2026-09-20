@@ -57,9 +57,10 @@ Threat model — what the sidecar does and does NOT defend against:
   (redirecting a signed ``.txt`` — the MAC does not match the new bytes), and
   symlink planting at the predictable paths on BOTH sides: publication uses
   ``atomic_write``/``os.replace`` (swaps a symlink out rather than following
-  it), and verification opens with ``O_NOFOLLOW`` + regular-file check so a
-  planted symlink can never make the trusted MCP process read a sensitive
-  target (see :func:`_read_regular_nofollow`).
+  it), and verification opens with ``O_NOFOLLOW | O_NONBLOCK`` + regular-file
+  check so a planted symlink can never make the trusted MCP process read a
+  sensitive target, and a planted FIFO is refused rather than waited on (see
+  :func:`_read_regular_nofollow`).
 * OUT OF SCOPE (unchanged from the env-only baseline): a same-uid agent
   deliberately launching its OWN process with attacker-chosen env
   (``KIROCREW_HOST_PID=<victim pid>``) to reuse a legitimate sidecar. This
@@ -182,6 +183,22 @@ _report_lock = threading.Lock()
 # claims, and an unlocked check-then-add lets two of them both pass the
 # membership test and emit duplicate reports.
 _reported: set[tuple[str, str]] = set()
+
+# Serializes publication against retraction for a single pid's mapping files.
+#
+# The two directions race over the same predictable paths: a teardown proves a
+# pid dead, then the OS recycles that number to a NEW runtime whose
+# ``publish_session_pid`` lands before the teardown's unlink, and the unlink
+# deletes the new runtime's identity instead of the dead one's. Both calls live
+# in the gateway process -- publication on the maintenance executor, retraction
+# on a provider teardown -- so one process-wide mutex is what closes the window;
+# :func:`unpublish_session_pid` additionally revalidates the body it decided on
+# immediately before unlinking, which holds against a second process too.
+#
+# Asymmetric on purpose: publication WAITS for it, retraction only TRIES. The
+# retraction side is on the event loop and the publication side holds this across
+# two fsyncs, and giving up on a retraction costs nothing a control depends on.
+_mapping_mutation_lock = threading.Lock()
 
 
 def _report_once(kind: str) -> tuple[bool, str]:
@@ -385,16 +402,134 @@ def publish_session_pid(pid: int, session_key: str) -> None:
         body = f"{session_key}\n{token}"
     else:
         body = session_key
-    atomic_write(_txt_path(pid, cfg), body)
-    key = _load_hmac_key()
-    if key is None:
-        _report_signing_unavailable()
-        try:
-            _sig_path(pid, cfg).unlink(missing_ok=True)
-        except OSError:
-            pass
-        return
-    atomic_write(_sig_path(pid, cfg), _compute_sig(key, pid, body))
+    # Held across both writes so a concurrent retraction of the PREVIOUS owner of
+    # a recycled pid number cannot land its unlink between them (see
+    # ``_mapping_mutation_lock``).
+    with _mapping_mutation_lock:
+        atomic_write(_txt_path(pid, cfg), body)
+        key = _load_hmac_key()
+        if key is None:
+            _report_signing_unavailable()
+            try:
+                _sig_path(pid, cfg).unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+        atomic_write(_sig_path(pid, cfg), _compute_sig(key, pid, body))
+
+
+def unpublish_session_pid(pid: int) -> bool:
+    """Retract a pid -> session-key mapping that provably names no live session.
+
+    The counterpart to :func:`publish_session_pid`, for a teardown that has
+    already proven its runtime is gone. It is the only per-pid retraction path:
+    ``_prune_stale_session_pid_files`` is reached solely from
+    ``cleanup_orphaned_sessions``, which ``session.py``'s module map records as
+    **startup + shutdown only**, so a gateway that keeps running holds every
+    mapping it publishes until it restarts. Measured on a Windows host: six
+    released sessions left twelve files behind within the hour, and two of those
+    pid numbers had already been recycled to unrelated live processes
+    (``cmd.exe``, an Office ``FileCoAuth.exe``) while still carrying a dashboard
+    slot's key.
+
+    That is the risk this closes, and it is why the sweep stays: a gateway that
+    dies without running a teardown is the case a hook cannot reach, so this is
+    an additional retraction path, never a replacement for the pass that bounds
+    accumulation.
+
+    Removal requires PROOF that the mapping does not describe a live session,
+    because the ``.txt`` is what ``mcp_caller`` resolves a tool call's identity
+    through -- deleting a live one costs that session its identity:
+
+    * the pid does not exist, or
+    * the mapping carries a start token and :func:`_pid_recycled` proves the
+      number names a different incarnation.
+
+    Anything else -- a live pid, an unreadable token, a legacy token-less
+    mapping whose pid still exists -- is retained. "Unknown" is never treated as
+    "dead", the same direction the sweep takes, so this can only ever remove a
+    file the sweep would also have removed.
+
+    Deciding and unlinking are two steps over a predictable path that a NEW
+    runtime may legitimately republish in between, once the OS recycles the pid
+    number. Both are therefore taken under ``_mapping_mutation_lock`` (which
+    :func:`publish_session_pid` also holds), and the body the decision was made
+    on is re-read immediately before the unlink -- a mapping that changed under
+    us belongs to whoever wrote it, so the retraction is abandoned rather than
+    deleting a live identity. The revalidation is what holds if the republisher
+    is a different process, where no in-process mutex reaches.
+
+    Nothing here ever WAITS. The caller is synchronous and reaches the gateway
+    event loop, so the mutex is tried rather than taken (a contended retraction
+    defers to the sweep), and each of the three syscall classes below is bounded
+    against a path an agent can plant on:
+
+    * the two body reads go through :func:`_read_regular_nofollow`, whose open
+      carries ``O_NOFOLLOW | O_NONBLOCK`` -- a planted symlink is refused by the
+      open itself, a planted FIFO by the ``S_ISREG`` check, and neither is
+      followed or waited on;
+    * the pid probes (``platform_compat.pid_exists``, and
+      ``get_process_start_id`` through :func:`_pid_recycled`) are in-process on
+      every platform -- a signal probe, a ``/proc/<pid>/stat`` read, or a
+      query-only process handle, never a subprocess -- and take an int, not a
+      path;
+    * the two unlinks name a DIRECTORY ENTRY, so they resolve no final symlink
+      and cannot reach whatever it points at.
+
+    There is deliberately no ``Path.exists()`` among them, anywhere. ``exists()``
+    stats THROUGH the final symlink, so one planted at ``session_pid_<pid>.txt``
+    aimed into a hung automount parks the loop inside the very probe meant to
+    make the read that follows it safe. Nothing is lost by its absence: a read
+    reports an absent path as ``None`` and an unlink reports one as
+    ``FileNotFoundError``, which is the whole of what a pre-flight probe was
+    asking. A DANGLING symlink at one of these paths is therefore a mapping to
+    retract, which is also what ``_prune_stale_session_pid_files`` does with it
+    (it unlinks the globbed entry unconditionally once the pid is proven dead),
+    so the invariant above still holds: this can only remove a file the sweep
+    would also have removed. ``unlink`` drops the link, never its target.
+
+    Returns True when the mapping was removed.
+    """
+    cfg = config_dir()
+    txt = _txt_path(pid, cfg)
+    sig = _sig_path(pid, cfg)
+    # Never WAIT for the mutex. This runs on a synchronous teardown that reaches
+    # the event loop, and the other side holds the lock across two
+    # ``atomic_write`` fsyncs on the maintenance executor -- so a blocking
+    # acquire would park the loop for the length of someone else's fsync. Giving
+    # up means not unlinking, which is the safe direction: the residue is exactly
+    # what ``_prune_stale_session_pid_files`` collects.
+    if not _mapping_mutation_lock.acquire(blocking=False):
+        logger.debug("Session pid mapping busy; retraction deferred to the sweep: %d", pid)
+        return False
+    try:
+        decided_on = _read_regular_nofollow(txt)
+        if platform_compat.pid_exists(pid):
+            parsed = _parse_mapping_body(decided_on) if decided_on is not None else None
+            token = parsed[1] if parsed else None
+            if not token or not _pid_recycled(pid, token):
+                # Live, or identity unprovable -- leave the mapping alone.
+                return False
+        # Last-moment revalidation: anything other than the exact body (or exact
+        # absence) the decision was made on means the mapping was republished.
+        if _read_regular_nofollow(txt) != decided_on:
+            logger.debug("Session pid mapping changed under retraction; kept: %d", pid)
+            return False
+        removed = False
+        for path in (txt, sig):
+            try:
+                # Bare ``unlink``, not ``missing_ok``: the exception IS the
+                # absence probe, so ``removed`` reports what this call actually
+                # deleted rather than what a separate stat predicted it would.
+                path.unlink()
+                removed = True
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.debug("Could not retract session pid mapping: %s", path.name)
+        return removed
+    finally:
+        _mapping_mutation_lock.release()
 
 
 # Upper bound for mapping-file reads. Session keys are short strings
@@ -424,6 +559,12 @@ def _read_regular_nofollow(path: Path) -> str | None:
       the vetted regular file — and the read is refused. This closes the
       TOCTOU race without platform-specific open flags (``st_ino`` is the
       NTFS file index on Windows since Python 3.5).
+    * ``O_NONBLOCK``: an ``O_RDONLY`` open of a FIFO with no writer BLOCKS
+      INDEFINITELY, and the ``S_ISREG`` rejection below only ever judges a
+      descriptor the open already returned — so without this flag a FIFO planted
+      at one of these predictable paths parks the calling thread instead of being
+      refused, and one caller is a synchronous retraction on the gateway event
+      loop. It is a no-op for the regular file this helper exists to read.
     * ``fstat``/``S_ISREG``: rejects FIFOs/devices.
     * Size bound (:data:`_MAX_MAPPING_FILE_BYTES`, checked against both
       ``fstat`` and the actual bytes read): rejects oversized files so
@@ -432,13 +573,14 @@ def _read_regular_nofollow(path: Path) -> str | None:
     Returns ``None`` on any refusal or I/O error (callers fail closed).
     """
     nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
     pre: os.stat_result | None = None
     try:
         if not nofollow:
             pre = os.lstat(path)
             if stat.S_ISLNK(pre.st_mode):
                 return None
-        fd = os.open(path, os.O_RDONLY | nofollow)
+        fd = os.open(path, os.O_RDONLY | nofollow | nonblock)
     except OSError:
         return None
     try:

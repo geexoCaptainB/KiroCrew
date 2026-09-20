@@ -10,6 +10,9 @@ tamper/degradation path.
 from __future__ import annotations
 
 import logging
+import os
+import threading
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -42,6 +45,24 @@ def records_from_this_module(caplog, level="ERROR"):
     return [
         r for r in caplog.records if r.levelname == level and r.name == LOGGER_NAME
     ]
+
+
+def release_fifo_reader(path, thread):
+    """Hand a parked FIFO reader the writer it is waiting for, then join it.
+
+    Only ever reached when the regression the caller pins is PRESENT: a daemon
+    thread blocked in ``open(O_RDONLY)`` on a writer-less FIFO outlives the test
+    that already failed, and a thread that can never finish is a lost RUN rather
+    than a failed test. ``O_WRONLY | O_NONBLOCK`` raises ``ENXIO`` when no reader
+    is waiting, which is the case where there is nothing to release.
+    """
+    if not thread.is_alive():
+        return
+    try:
+        os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+    except OSError:
+        pass
+    thread.join(10)
 
 
 @pytest.fixture
@@ -234,6 +255,38 @@ class TestLenientReader:
             "x" * (session_pid_sig._MAX_MAPPING_FILE_BYTES + 1), encoding="utf-8"
         )
         assert session_pid_sig.read_session_pid_txt(4242) == ""
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="os.mkfifo is POSIX-only")
+    def test_a_planted_fifo_is_refused_instead_of_waited_on(self, cfg):
+        """FIFO ATTACK on the shared hardened reader: refused, never waited on.
+
+        ``O_NOFOLLOW`` refuses a symlink but says nothing about a FIFO, and an
+        ``O_RDONLY`` open of a FIFO with no writer BLOCKS INDEFINITELY -- so the
+        ``S_ISREG`` rejection cannot run, because it only judges a descriptor the
+        open already returned. ``O_NONBLOCK`` is what lets the open return so the
+        check can refuse it. Both this lenient reader (on the MCP caller-identity
+        path) and the retraction below reach that one helper.
+
+        Bounded with a real timeout rather than a plain assertion because the
+        failure mode is "never returns": no writer is ever opened on this FIFO,
+        so without the flag the probe thread parks forever.
+        """
+        fifo = cfg / "session_pid_4242.txt"
+        os.mkfifo(fifo)
+        done = threading.Event()
+        seen: list[str] = []
+
+        def probe() -> None:
+            seen.append(session_pid_sig.read_session_pid_txt(4242))
+            done.set()
+
+        reader = threading.Thread(target=probe, daemon=True)
+        reader.start()
+        try:
+            assert done.wait(10), "the open waited for a FIFO writer instead of refusing"
+        finally:
+            release_fifo_reader(fifo, reader)
+        assert seen == [""], "a non-regular file must read as absent"
 
 
 class TestPidRecycleGuard:
@@ -690,3 +743,260 @@ class TestSigningHealth:
         assert "signing_health" not in inspect.getsource(
             token_auth.warm_auth_singletons
         )
+
+
+class TestUnpublish:
+    """``unpublish_session_pid`` retracts ONLY a mapping that provably names no
+    live session.
+
+    The motivation is measured rather than hypothetical. On a Windows host six
+    released sessions left twelve ``session_pid_*`` files behind inside an hour,
+    and two of those pid numbers had already been recycled to unrelated live
+    processes (a ``cmd.exe`` and an Office ``FileCoAuth.exe``) while still
+    carrying a dashboard slot's key. ``_prune_stale_session_pid_files`` is the
+    other retraction path and it is reached solely from
+    ``cleanup_orphaned_sessions`` -- startup + shutdown only -- so a gateway that
+    keeps running retracts nothing.
+
+    The direction of every decision below is the same as that sweep's: proof of
+    death removes, and "unknown" retains. The ``.txt`` is what ``mcp_caller``
+    resolves a tool call's caller identity through, so removing a live one would
+    cost that session its identity.
+    """
+
+    def test_removes_the_mapping_when_the_pid_is_gone(self, cfg):
+        session_pid_sig.publish_session_pid(4242, SESSION_KEY)
+        assert (cfg / "session_pid_4242.txt").exists()
+        assert (cfg / "session_pid_4242.sig").exists()
+
+        with patch.object(platform_compat, "pid_exists", return_value=False):
+            assert session_pid_sig.unpublish_session_pid(4242) is True
+
+        assert not (cfg / "session_pid_4242.txt").exists()
+        assert not (cfg / "session_pid_4242.sig").exists()
+
+    def test_keeps_a_live_legacy_mapping(self, cfg):
+        """An absent recorded token is identity UNKNOWN, never read as dead."""
+        session_pid_sig.publish_session_pid(4242, SESSION_KEY)  # fixture: token None
+        with patch.object(platform_compat, "pid_exists", return_value=True):
+            assert session_pid_sig.unpublish_session_pid(4242) is False
+        assert (cfg / "session_pid_4242.txt").exists()
+
+    def test_keeps_a_live_mapping_whose_token_still_matches(self, cfg):
+        """Same pid, same incarnation: this is a session that is still serving."""
+        with patch.object(platform_compat, "get_process_start_id", return_value="tok-1"):
+            session_pid_sig.publish_session_pid(4242, SESSION_KEY)
+            with patch.object(platform_compat, "pid_exists", return_value=True):
+                assert session_pid_sig.unpublish_session_pid(4242) is False
+        assert (cfg / "session_pid_4242.txt").exists()
+
+    def test_removes_a_mapping_whose_pid_was_recycled(self, cfg):
+        """The measured case: the number is live, but it is a different process."""
+        with patch.object(platform_compat, "get_process_start_id", return_value="tok-1"):
+            session_pid_sig.publish_session_pid(4242, SESSION_KEY)
+
+        with (
+            patch.object(platform_compat, "pid_exists", return_value=True),
+            patch.object(platform_compat, "get_process_start_id", return_value="tok-2"),
+        ):
+            assert session_pid_sig.unpublish_session_pid(4242) is True
+
+        assert not (cfg / "session_pid_4242.txt").exists()
+        assert not (cfg / "session_pid_4242.sig").exists()
+
+    def test_an_absent_mapping_is_not_an_error(self, cfg):
+        with patch.object(platform_compat, "pid_exists", return_value=False):
+            assert session_pid_sig.unpublish_session_pid(4242) is False
+
+    def test_a_dangling_sidecar_is_retracted_with_the_mapping(self, cfg):
+        """A ``.sig`` whose ``.txt`` is already gone still accumulates."""
+        session_pid_sig.publish_session_pid(4242, SESSION_KEY)
+        (cfg / "session_pid_4242.txt").unlink()
+        with patch.object(platform_compat, "pid_exists", return_value=False):
+            assert session_pid_sig.unpublish_session_pid(4242) is True
+        assert not (cfg / "session_pid_4242.sig").exists()
+
+    def test_a_republished_mapping_survives_the_retraction_it_raced(self, cfg):
+        """Decide and unlink are two steps; a body that moved between them wins.
+
+        The window is real rather than theoretical: this teardown proves pid P
+        dead, the OS recycles P to a NEW runtime, and that runtime's
+        ``publish_session_pid`` lands before the unlink. Deleting then would cost
+        the new session the identity ``mcp_caller`` resolves its tool calls
+        through -- the worst outcome this function can produce. The revalidation
+        is the half that holds when the republisher is another process, where the
+        module mutex does not reach, so it is pinned separately from the mutex.
+        """
+        session_pid_sig.publish_session_pid(4242, SESSION_KEY)
+        republished = "dashboard:chat-brand-new"
+        moved = False
+
+        def read(path):
+            # The first read is the decision; the second is the revalidation, by
+            # which point the recycled pid's new owner has republished.
+            nonlocal moved
+            already_read = moved
+            moved = True
+            return republished if already_read else SESSION_KEY
+
+        with (
+            patch.object(platform_compat, "pid_exists", return_value=False),
+            patch.object(session_pid_sig, "_read_regular_nofollow", side_effect=read),
+        ):
+            assert session_pid_sig.unpublish_session_pid(4242) is False
+
+        assert (cfg / "session_pid_4242.txt").exists(), "raced retraction deleted a live mapping"
+        assert (cfg / "session_pid_4242.sig").exists()
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="os.mkfifo is POSIX-only")
+    def test_a_planted_fifo_does_not_park_the_retraction(self, cfg):
+        """The retraction runs on the event loop, so it must not be parkable.
+
+        ``AcpClient._reset_state`` is synchronous and runs on the gateway's one
+        event loop; it calls ``_untrack_session_pid``, which calls this. An agent
+        that plants a FIFO at the predictable ``session_pid_<pid>.txt`` path would
+        therefore freeze every task on that loop -- the chat turn AND the liveness
+        heartbeat -- on an ``open`` waiting for a writer that never arrives.
+
+        The FIFO is left in place: a read the helper refuses is UNKNOWN identity,
+        and unknown retains (no writer is opened here either, so the timeout is
+        the assertion).
+        """
+        fifo = cfg / "session_pid_4242.txt"
+        os.mkfifo(fifo)
+        done = threading.Event()
+        verdict: list[bool] = []
+
+        def probe() -> None:
+            with patch.object(platform_compat, "pid_exists", return_value=True):
+                verdict.append(session_pid_sig.unpublish_session_pid(4242))
+            done.set()
+
+        reader = threading.Thread(target=probe, daemon=True)
+        reader.start()
+        try:
+            assert done.wait(10), "retraction parked the event loop on a planted FIFO"
+        finally:
+            release_fifo_reader(fifo, reader)
+        assert verdict == [False]
+        assert fifo.is_fifo(), "refusal is not deletion"
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="os.mkfifo is POSIX-only")
+    def test_a_planted_symlink_does_not_park_the_retraction_on_a_stat(self, cfg):
+        """A stat that FOLLOWS a planted symlink is the loop's other parking spot.
+
+        ``Path.exists()`` resolves the final component, so a symlink planted at
+        the predictable ``session_pid_<pid>.txt`` and aimed into a filesystem
+        that does not answer -- a hung automount, a dead NFS server -- parks the
+        gateway event loop inside the probe, before the hardened reader whose
+        ``O_NOFOLLOW`` was supposed to make touching that path safe ever runs.
+
+        A stat that never returns is what such a mount IS, so that is what is
+        planted here: the link is real and its target is a writer-less FIFO, and
+        ``Path.exists`` on the two mapping paths alone is held open for the
+        length of the probe. Bounded with a timeout rather than a plain
+        assertion because the failure mode is "never returns", and the hold is
+        released in ``finally`` so a thread parked by a regression cannot outlive
+        the test and turn a failure into a lost run.
+        """
+        fifo = cfg / "planted-fifo"
+        os.mkfifo(fifo)
+        link = cfg / "session_pid_4242.txt"
+        link.symlink_to(fifo)
+        watched = {link, cfg / "session_pid_4242.sig"}
+        released = threading.Event()
+        real_exists = Path.exists
+
+        def unanswering_exists(self, *args, **kwargs):
+            if self in watched:
+                released.wait(30)
+            return real_exists(self, *args, **kwargs)
+
+        done = threading.Event()
+        verdict: list[bool] = []
+
+        def probe() -> None:
+            with patch.object(platform_compat, "pid_exists", return_value=False):
+                verdict.append(session_pid_sig.unpublish_session_pid(4242))
+            done.set()
+
+        prober = threading.Thread(target=probe, daemon=True)
+        with patch.object(Path, "exists", unanswering_exists):
+            prober.start()
+            try:
+                assert done.wait(10), "a symlink-following stat parked the retraction"
+            finally:
+                released.set()
+                prober.join(10)
+        assert verdict == [True]
+        assert not link.is_symlink(), "the planted link outlived a proven-dead pid"
+        assert fifo.is_fifo(), "the unlink dropped the link, not its target"
+
+    def test_a_dangling_symlinked_mapping_is_retracted_like_the_sweep_does(self, cfg):
+        """A link to nothing still occupies the path, so a dead pid retracts it.
+
+        This is the one answer that a non-following retraction changes: a
+        dangling symlink has no stat to succeed, so a following probe reads the
+        path as empty and leaves the link sitting at it. The sweep does not --
+        ``_prune_stale_session_pid_files`` globs the directory entry and unlinks
+        it once the pid is proven dead -- and the two paths must not disagree
+        about the same file, or the docstring's "can only remove what the sweep
+        would also remove" stops being true in the direction that accumulates.
+        """
+        link = cfg / "session_pid_4242.txt"
+        link.symlink_to(cfg / "target-that-was-never-created")
+        with patch.object(platform_compat, "pid_exists", return_value=False):
+            assert session_pid_sig.unpublish_session_pid(4242) is True
+        assert not link.is_symlink()
+
+    def test_a_live_pid_keeps_even_a_dangling_symlinked_mapping(self, cfg):
+        """Retracting a link to nothing is still gated on proof of death.
+
+        An unreadable mapping is identity UNKNOWN, and unknown retains -- the
+        same direction as every other branch. Pinned separately because the
+        unlink reached by dropping the stat is otherwise one proof away from
+        deleting a path whose owner is still running.
+        """
+        link = cfg / "session_pid_4242.txt"
+        link.symlink_to(cfg / "target-that-was-never-created")
+        with patch.object(platform_compat, "pid_exists", return_value=True):
+            assert session_pid_sig.unpublish_session_pid(4242) is False
+        assert link.is_symlink()
+
+    def test_retraction_never_waits_for_the_publication_mutex(self, cfg):
+        """Contention defers the retraction; it never blocks the loop on a peer.
+
+        The other side of this mutex is ``publish_session_pid``, which holds it
+        across two ``atomic_write`` fsyncs on the maintenance executor. A blocking
+        acquire here would hand the event loop the length of that fsync. Giving up
+        costs nothing a control depends on -- the mapping is simply left for
+        ``_prune_stale_session_pid_files``, the same outcome as an unproven death.
+        """
+        session_pid_sig.publish_session_pid(4242, SESSION_KEY)
+        done = threading.Event()
+        verdict: list[bool] = []
+
+        def probe() -> None:
+            with patch.object(platform_compat, "pid_exists", return_value=False):
+                verdict.append(session_pid_sig.unpublish_session_pid(4242))
+            done.set()
+
+        with session_pid_sig._mapping_mutation_lock:
+            threading.Thread(target=probe, daemon=True).start()
+            assert done.wait(10), "retraction waited for the publication mutex"
+            assert verdict == [False]
+            assert (cfg / "session_pid_4242.txt").exists(), "a deferred retraction deletes nothing"
+
+    def test_publication_and_retraction_take_the_same_mutex(self):
+        """Serialization is the in-process half of the same fix.
+
+        Both directions mutate one predictable path, and both run in the gateway
+        process -- publication on the maintenance executor, retraction on a
+        provider teardown -- so a shared mutex is what stops them interleaving at
+        all. Pinned structurally because a lock that one side quietly stops
+        taking still passes every single-threaded behavioural test above.
+        """
+        import inspect
+
+        for fn in (session_pid_sig.publish_session_pid, session_pid_sig.unpublish_session_pid):
+            assert "_mapping_mutation_lock" in inspect.getsource(fn), fn.__name__

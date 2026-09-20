@@ -767,7 +767,18 @@ send time.
   `session.timeout_secs` and `session.watchdog_rss_max_mb` off the manager's
   current `_cfg` (which the config watcher keeps current) and re-applying the
   same bounds the loader does — the 60s floor, the `0` = sweep-disabled
-  sentinel, and the non-negative-int coercion of the RSS ceiling. The sleep
+  sentinel, and the non-negative-int coercion of the RSS ceiling — plus a
+  `MAX_TICK_INTERVAL_SECS` = 300s **ceiling on the derived interval itself**.
+  The ceiling exists because one tick drives the idle-expiry hook AND every
+  housekeeping sweep below it, so deriving the cadence from `timeout_secs`
+  alone coupled the sweeps to a setting about something else and coupled it
+  backwards: `timeout_secs=86400` gave an `86400 // 6` four-hour tick while
+  DISABLING idle expiry (`timeout_secs=0`) gave 300s, so asking for long-lived
+  sessions bought slower orphan cleanup than switching the idle sweep off.
+  Capping cannot expire a session early — `_expire_idle_hook` passes
+  `state.idle_timeout`, so the timeout still decides WHEN a session is stale
+  and the interval only decides how often the question is asked — and it is a
+  ceiling, not a floor, so sub-300s intervals are untouched. The sleep
   between sweeps is chopped into waits of at most `POLICY_REFRESH_SECS` (60s);
   each wake re-adopts the policy and, when the interval moved, re-anchors the
   next sweep to the last sweep plus the new interval, so a shortened timeout
@@ -840,8 +851,8 @@ send time.
   old skipped scopes are summarized at INFO by stable reason category, making
   that residual operator-visible. Stale
   `session_pid_<pid>.txt`/`.sig` files are separately pruned by
-  `_prune_stale_session_pid_files` (below); the reaper adds no second deletion
-  path.
+  `_prune_stale_session_pid_files` and by the per-pid `unpublish_session_pid`
+  retraction (both below); the reaper itself adds no deletion path of its own.
 - **Stuck-turn reporting** (`_stuck_turn_check`, threshold
   `_STUCK_TURN_REPORT_SECS` = 300s, not configurable): reports a turn whose
   consumer has stopped pulling events. Exists because the per-turn watchdog in
@@ -2544,6 +2555,52 @@ a trust root on its own; publication therefore also writes a
   graceful-shutdown sweep asks for the narrowing. This pass touches only the
   `session_pid_<pid>` family, never the shared `kiro_session_pids.txt` that
   pass 1 rewrites.
+- **Per-pid retraction** (`unpublish_session_pid`, `session_pid_sig.py`): the
+  counterpart to `publish_session_pid`, called from `_untrack_session_pid` on
+  provider teardown. It exists because the sweep above is reached only from
+  `cleanup_orphaned_sessions` — **startup + shutdown only** — so a gateway that
+  keeps running holds every mapping it publishes until it restarts (measured on
+  a Windows host: twelve files from six released sessions inside an hour, two of
+  those pid numbers already recycled to unrelated live processes while still
+  carrying a dashboard slot's key). It is an ADDITIONAL path, never a
+  replacement: a gateway that dies without running a teardown is the case no
+  hook reaches. The proof-of-death rule is the sweep's direction, not the call
+  site's word: removal requires that the pid does not exist, or that the mapping
+  carries a start token and `_pid_recycled` proves the number names a different
+  incarnation. A live pid, an unreadable token, or a legacy token-less mapping
+  whose pid still exists is RETAINED — which is why the compaction/reset/replace
+  path, which untracks a pid whose process is still alive, keeps its mapping.
+  Deciding and unlinking are two steps over a path a recycled pid's new owner
+  may legitimately republish between them, so both run under
+  `_mapping_mutation_lock` (held by `publish_session_pid` too) and the decided-on
+  body is re-read immediately before the unlink; a body that moved abandons the
+  retraction, which is what holds when the republisher is a different process.
+  The retraction is hygiene, not a control: `_untrack_session_pid` swallows its
+  failures and never lets one change the tracking-file verdict
+  `retire_windows_tree_tracking` fails closed on.
+  Because `_untrack_session_pid` is synchronous and `AcpClient._reset_state`
+  calls it on the event loop, the retraction never WAITS for anything
+  (`no-blocking-call-on-event-loop`). The mutex is *tried*, not taken — a
+  contended retraction defers to the sweep, which is the same safe direction as
+  a failed proof — and the shared hardened reader opens with
+  `O_NOFOLLOW | O_NONBLOCK`, so a FIFO planted at one of these predictable
+  agent-writable paths is refused by the `S_ISREG` check rather than parking the
+  loop on an `open` that waits for a writer. That flag is on
+  `_read_regular_nofollow` itself rather than this call site, so the strict
+  verifier and the lenient `read_session_pid_txt` on the MCP identity path get
+  the same guarantee; it is a no-op for the regular file the helper exists to
+  read. What remains on the loop is three syscall classes, each bounded against
+  a planted path: two reads through that helper (capped at
+  `_MAX_MAPPING_FILE_BYTES`), in-process pid probes that take an int rather than
+  a path, and two unlinks that name a directory ENTRY and so resolve no final
+  symlink. There is deliberately no `Path.exists()` among them — it stats
+  THROUGH the final component, so a symlink planted at one of these paths and
+  aimed into a hung automount would park the loop inside the probe guarding the
+  read, and a read already answers an absent path with `None` while an unlink
+  answers it with `FileNotFoundError`. One consequence is load-bearing: a
+  DANGLING symlink at a mapping path is a file to retract, which is what the
+  sweep above already does with it, so "this can only remove a file the sweep
+  would also have removed" still holds.
 - **Member execution routing**: the ordinary session/run owner record carries
   the immutable member/store snapshot. Strict MCP caller identity still uses
   the existing transport token and signed `session_pid` publication. No separate
