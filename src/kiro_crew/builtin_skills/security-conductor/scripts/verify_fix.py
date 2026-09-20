@@ -272,6 +272,16 @@ CONTRACT_UNREADABLE = 20
 #: the more specific statement, and here the caller is this gate.
 CONTRACT_BASE = "origin/main"
 
+#: Why a ``test`` row was not run. Running one executes code out of the fixed
+#: worktree, which this gate does while a conductor-declared blast radius covers
+#: every changed path in it. A contract that is violated or unreadable leaves that
+#: uncovered, so the row is reported rather than run.
+CONTRACT_SKIPPED_TEST_ROW = (
+    "not run: the declared fix contract did not settle as honoured, so running a test"
+    " row would execute code from a worktree whose changed paths are not known to sit"
+    " inside the declared blast radius"
+)
+
 #: The pytest argv every ``test`` row runs under, before its selector. ``-n 0``
 #: keeps xdist from forking workers for one node, ``-o addopts=`` drops the
 #: repository's own ``addopts`` (coverage gates, ``-n auto``, a ``--splits`` shard)
@@ -1149,7 +1159,10 @@ def run_test_row(
 
 
 def check_test_rows(
-    rows: list[dict[str, Any]], worktree: Path, timeout: int
+    rows: list[dict[str, Any]],
+    worktree: Path,
+    timeout: int,
+    contract_verdict: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
     """Run the behaviour corpus. ``(broken, unverifiable, checked)``.
 
@@ -1157,10 +1170,25 @@ def check_test_rows(
     a corpus the caller gets to shrink: the fixer running the gate would choose which
     half of it applies. A row that cannot be run is reported ``unverifiable`` by the
     paths below, which is a verdict rather than a choice.
+
+    ``contract_verdict`` is the one thing that stops a row from being run, and it is
+    not such a choice: it is this script's own verdict from
+    :func:`run_contract_check`, which the subject of the check cannot set. Running a
+    row means executing code out of the fixed worktree -- pytest imports the named
+    module and the ``conftest.py`` above it. That is sound while the contract holds,
+    because then every changed path is inside a blast radius a conductor declared
+    outside the worktree. A violated or unreadable contract withdraws exactly that
+    assurance, so the rows are reported ``unverifiable`` and pytest is never invoked.
+    The verdict does not move: ``broken`` and ``unverifiable`` both outrank the
+    ``unverifiable`` these rows contribute.
     """
     broken: list[dict[str, Any]] = []
     unsettled: list[dict[str, Any]] = []
     if not rows:
+        return broken, unsettled, 0
+    if contract_verdict is not None:
+        for row in rows:
+            unsettled.append(describe_row(row, CONTRACT_SKIPPED_TEST_ROW))
         return broken, unsettled, 0
     python = classifier_python(worktree)
     available, note = pytest_available(python, worktree, timeout)
@@ -1209,9 +1237,16 @@ def describe_row(row: dict[str, Any], why: str) -> dict[str, Any]:
 
 
 def check_golden_paths(
-    rows: list[dict[str, Any]], worktree: Path, timeout: int
+    rows: list[dict[str, Any]],
+    worktree: Path,
+    timeout: int,
+    contract_verdict: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], int]:
     """Classify the shell corpus, run the test corpus, hand every other kind to a human.
+
+    ``contract_verdict`` reaches :func:`check_test_rows`, which stops running rows
+    when it is set. Shell rows are still classified either way: classification reads
+    the worktree's fence rather than running a corpus row through it.
 
     Returns ``(broken, unverifiable, needs_human, checked)``. The split is the
     design: the first two are verdicts about checks this script makes, and the third
@@ -1240,7 +1275,10 @@ def check_golden_paths(
             broken.append(describe_row(row, f"the deny fence refuses it: {refusal}"))
 
     test_broken, test_unsettled, test_checked = check_test_rows(
-        [row for row in rows if str(row["kind"]) == TEST_KIND], worktree, timeout
+        [row for row in rows if str(row["kind"]) == TEST_KIND],
+        worktree,
+        timeout,
+        contract_verdict,
     )
     broken.extend(test_broken)
     unsettled.extend(test_unsettled)
@@ -1401,7 +1439,12 @@ def main(argv: list[str] | None = None) -> int:
     # does not change -- ``reproduces`` outranks everything -- but a fix that failed
     # AND broke three legitimate operations is one round of feedback instead of two,
     # and the second round would only be reached after the first was fixed.
-    broken, unsettled, needs_human, checked = check_golden_paths(rows, worktree, args.timeout)
+    # The contract verdict travels with the corpus check: a worktree whose changed
+    # paths are not known to sit inside the declared blast radius is one this gate
+    # reads but does not run. See :func:`check_test_rows`.
+    broken, unsettled, needs_human, checked = check_golden_paths(
+        rows, worktree, args.timeout, contract_verdict
+    )
 
     # A corpus that could not be read is not a corpus that passed. Zero rows checked
     # would fold to ``holds`` by construction, which is exactly the vacuous green a

@@ -51,6 +51,7 @@ against is the worktree's own rather than an installed package it fell through t
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -1218,7 +1219,10 @@ class TestTheShippedCorpusIsALiveGate:
         assert 25 <= len(rows) <= 60, len(rows)
         assert all(row["reason"] for row in rows)
         kinds = {row["kind"] for row in rows}
-        assert kinds == {"shell", "flow", "cron"}
+        # Four kinds ship, and each is one the verifier knows what to do with: a
+        # "shell" row it classifies against the real fence, "flow" and "cron" rows
+        # it records for a human to exercise, and a "test" row it runs as pytest.
+        assert kinds == {"shell", "flow", "cron", "test"}
         # Both halves of the lock-in guard are present, or the corpus asserts
         # nothing about the second failure mode it exists for.
         platforms = {row["platform"] for row in rows}
@@ -1242,6 +1246,54 @@ class TestTheShippedCorpusIsALiveGate:
                     broken[command] = f"[{name}] {outcome}"
                     break
         assert not broken, json.dumps(broken, indent=2, sort_keys=True)
+
+    def test_every_shipped_test_row_resolves_in_this_repository(self, rows: list[dict]) -> None:
+        """A shipped ``test`` row names a node that EXISTS here, asserted at review time.
+
+        The other rows in this class are checked for shape, and a selector's shape says
+        nothing about whether the node it names is still there. A rename or a deleted
+        test leaves the row pointing at nothing, ``verify_fix.py`` reads that as
+        ``unverifiable`` on every fix from then on, and the corpus carries a row that
+        gates nothing while looking like it does.
+
+        Resolution is read out of the module's own AST rather than by running pytest.
+        A nested ``--collect-only`` would inherit this host's temp directory, and on a
+        host whose temp root sits inside the live data home the child's own guard
+        refuses the run -- a test that passes in CI and fails on a maintainer's box.
+        What this asserts is therefore narrower than collection, and it is the half
+        that rots: the file is present and every ``::`` name is defined in it.
+        """
+        selectors = [row["command_or_flow"] for row in rows if row["kind"] == "test"]
+        assert selectors, "the corpus carries no test row for this check to resolve"
+        unresolved: dict[str, str] = {}
+        for selector in selectors:
+            path_part, *names = selector.split("::")
+            module = REPO_ROOT / path_part
+            if not module.is_file():
+                unresolved[selector] = f"{path_part} is not a file in this repository"
+                continue
+            try:
+                scope: list[ast.stmt] = ast.parse(
+                    module.read_text(encoding="utf-8"), filename=str(module)
+                ).body
+            except SyntaxError as exc:  # pragma: no cover - a parse error is its own bug
+                unresolved[selector] = f"{path_part} does not parse: {exc}"
+                continue
+            for name in names:
+                match = next(
+                    (
+                        node
+                        for node in scope
+                        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                        and node.name == name
+                    ),
+                    None,
+                )
+                if match is None:
+                    unresolved[selector] = f"{path_part} defines no {name}"
+                    break
+                scope = match.body
+        assert not unresolved, json.dumps(unresolved, indent=2, sort_keys=True)
 
     def test_every_shipped_cron_row_is_a_wellformed_pair(self, rows: list[dict]) -> None:
         """Asserted HERE, at review time, rather than by the script at run time.
@@ -1340,6 +1392,23 @@ def a_behaviour_file(worktree: Path, relative: str, body: str) -> None:
     path = worktree / relative
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
+
+
+#: The file the conftest below writes, directly under the worktree.
+SENTINEL_NAME = "the-conftest-ran.txt"
+
+#: A ``conftest.py`` for the fixer's own worktree that records having been imported.
+#: pytest imports the conftest above a selector before collecting anything, so this
+#: file existing afterwards means the gate ran pytest out of that worktree, and it
+#: being absent means the gate did not. That is the capability a ``test`` row carries,
+#: written so a test can assert on it. The path is derived from ``__file__`` rather
+#: than an environment variable because ``child_env`` inherits no name a caller sets.
+CONFTEST_THAT_RECORDS_ITS_IMPORT = f"""from pathlib import Path
+
+Path(__file__).resolve().parent.parent.joinpath({SENTINEL_NAME!r}).write_text(
+    "the conftest ran", encoding="utf-8"
+)
+"""
 
 
 class TestTheFixContractIsStepZero:
@@ -1448,6 +1517,115 @@ class TestTheFixContractIsStepZero:
     def test_the_filename_is_the_switch_when_no_copy_is_named(self, mod) -> None:
         """With no ``--contract``, the worktree's own file decides whether the step runs."""
         assert mod.CONTRACT_FILENAME == "fix-contract.json"
+
+
+class TestAnUnsettledContractStopsTheGateRunningTheWorktree:
+    """A ``test`` row runs code out of the fixed worktree; the contract licenses it.
+
+    Running a row means pytest imports the named module and the ``conftest.py`` above
+    it, with the operator's access. What makes that sound is the contract step: every
+    changed path in the worktree sits inside a blast radius a conductor declared
+    outside it. A violated or unreadable contract withdraws that, so the rows are
+    reported instead of run.
+
+    The sentinel is the assertion. A ``conftest.py`` that writes a file when imported
+    turns "pytest was never invoked" into something observable, rather than a claim
+    about which branch was taken.
+    """
+
+    def a_row_and_its_sentinel(self, staged: Path, worktree: Path) -> Path:
+        """One passing ``test`` row, and the conftest that records running it."""
+        a_behaviour_file(worktree, "test/test_behaviour.py", PASSING_TEST)
+        a_behaviour_file(worktree, "test/conftest.py", CONFTEST_THAT_RECORDS_ITS_IMPORT)
+        a_golden_path(staged, kind="test", command="test/test_behaviour.py")
+        install_verifier(staged, VERIFIER_REJECTED)
+        return worktree / SENTINEL_NAME
+
+    def test_a_violated_contract_runs_no_pytest_at_all(self, staged: Path, tmp_path: Path) -> None:
+        """THE ROUND: the fix left its radius, so its worktree is read and not run."""
+        worktree = build_repo(
+            tmp_path,
+            "violated-no-run",
+            committed=("src/kiro_crew/x.py", "src/kiro_crew/sandbox.py"),
+        )
+        sentinel = self.a_row_and_its_sentinel(staged, worktree)
+        held = held_contract(tmp_path, "violated-no-run", A_CONTRACT)
+        result = run_fix(
+            staged, tmp_path / "findings.db", worktree, extra=["--contract", str(held)]
+        )
+        assert result.returncode == EXIT_BROKEN, result.stdout
+        # The proof: the worktree's conftest was never imported, so no pytest ran.
+        assert not sentinel.exists(), sentinel.read_text(encoding="utf-8")
+        body = payload(result)
+        assert body["contract"]["verdict"] == "broken"
+        # Reported, not silently dropped -- and not counted as a row that was checked.
+        assert body["golden_paths_checked"] == 0
+        assert [row["kind"] for row in body["unverifiable"]] == ["test"]
+        assert "declared fix contract did not settle as honoured" in (
+            body["unverifiable"][0]["why"]
+        )
+
+    def test_an_unreadable_contract_runs_no_pytest_either(
+        self, staged: Path, tmp_path: Path
+    ) -> None:
+        """Unreadable is not honoured: the same licence is missing, so the same skip."""
+        worktree = build_repo(tmp_path, "unreadable-no-run", committed=("src/kiro_crew/x.py",))
+        sentinel = self.a_row_and_its_sentinel(staged, worktree)
+        held = tmp_path / "unreadable-held.json"
+        held.write_text("{not json", encoding="utf-8")
+        result = run_fix(
+            staged, tmp_path / "findings.db", worktree, extra=["--contract", str(held)]
+        )
+        assert result.returncode == EXIT_UNVERIFIABLE, result.stdout
+        assert not sentinel.exists(), sentinel.read_text(encoding="utf-8")
+        body = payload(result)
+        assert body["contract"]["verdict"] == "unverifiable"
+        assert body["golden_paths_checked"] == 0
+        assert [row["kind"] for row in body["unverifiable"]] == ["test"]
+
+    def test_an_honoured_contract_does_run_the_row(self, staged: Path, tmp_path: Path) -> None:
+        """The positive control: the licence is what the skip turns on, not the row.
+
+        Without this, a screen that refused every ``test`` row unconditionally would
+        pass the two cases above and cost the corpus its whole behaviour half.
+        """
+        worktree = build_repo(tmp_path, "honoured-does-run", committed=("src/kiro_crew/x.py",))
+        sentinel = self.a_row_and_its_sentinel(staged, worktree)
+        held = held_contract(tmp_path, "honoured-does-run", A_CONTRACT)
+        result = run_fix(
+            staged, tmp_path / "findings.db", worktree, extra=["--contract", str(held)]
+        )
+        assert result.returncode == EXIT_HOLDS, result.stderr
+        assert sentinel.exists(), result.stderr
+        body = payload(result)
+        assert body["contract"]["verdict"] == "holds"
+        assert body["golden_paths_checked"] == 1
+        assert body["unverifiable"] == []
+
+    def test_a_shell_row_is_still_classified_under_a_violated_contract(
+        self, staged: Path, tmp_path: Path
+    ) -> None:
+        """Classification reads the fence; it does not run a corpus row through it."""
+        worktree = build_repo(
+            tmp_path,
+            "violated-shell",
+            committed=("src/kiro_crew/x.py", "src/kiro_crew/sandbox.py"),
+        )
+        a_golden_path(staged, kind="shell", command="git status --porcelain")
+        install_verifier(staged, VERIFIER_REJECTED)
+        held = held_contract(tmp_path, "violated-shell", A_CONTRACT)
+        result = run_fix(
+            staged,
+            tmp_path / "findings.db",
+            worktree,
+            fence=fence("REFUSE-ME"),
+            extra=["--contract", str(held)],
+        )
+        assert result.returncode == EXIT_BROKEN, result.stdout
+        body = payload(result)
+        assert body["contract"]["verdict"] == "broken"
+        assert body["golden_paths_checked"] == 1
+        assert body["unverifiable"] == []
 
 
 class TestTheTestKindIsRunAgainstTheFix:
