@@ -88,19 +88,68 @@ class _Log:
     """``ConversationLog`` stand-in over one in-memory metadata dict.
 
     Implements the real ``update_metadata_if`` contract: the guard is evaluated
-    against the record as it stands at write time, and the return value says
-    whether the merge was applied.
+    against the record as it stands at write time, the return value says whether
+    the merge was applied, and ``require_existing`` refuses a session with no
+    file at all. *exists* stands for that file, which is a separate question from
+    what the metadata dict holds -- in the real store an absent session and an
+    untitled one both reach the guard as ``{}``.
+
+    *becomes* models the record being REPLACED during the naming turn: the first
+    status read (the caller's own, before the turn) sees the original, and
+    everything after it sees the replacement. That is what a deletion plus a new
+    message on the same thread does, because the session key is derived from the
+    thread rather than from the record. An empty *becomes* means the record is
+    GONE, which is a different state from a record that is merely stamp-less.
+
+    *becomes_unreadable* models the first line being damaged during the turn: the
+    real store answers ``({}, False)`` for that, without raising, and refuses the
+    write. An unreadable record is evidence of neither presence nor absence.
     """
 
-    def __init__(self, meta: dict | None = None, raises: BaseException | None = None):
+    def __init__(
+        self,
+        meta: dict | None = None,
+        raises: BaseException | None = None,
+        *,
+        exists: bool = True,
+        becomes: dict | None = None,
+        becomes_unreadable: bool = False,
+    ):
         self.meta = dict(meta or {})
         self.raises = raises
+        self.exists = exists
+        self.becomes = becomes
+        self.becomes_unreadable = becomes_unreadable
+        self.readable = True
         self.guarded_calls: list[tuple[str, dict]] = []
+        self.required_existing: list[bool] = []
+        self.metadata_reads: list[str] = []
 
-    def update_metadata_if(self, key, fields, guard):
+    def get_metadata_status(self, key: str) -> tuple[dict, bool]:
+        self.metadata_reads.append(key)
+        current = (dict(self.meta) if self.exists else {}, self.readable)
+        if len(self.metadata_reads) == 1:
+            if self.becomes is not None:
+                self.meta = dict(self.becomes)
+                self.exists = bool(self.becomes)
+            if self.becomes_unreadable:
+                self.readable = False
+        return current
+
+    def get_metadata(self, key: str) -> dict:
+        return self.get_metadata_status(key)[0]
+
+    def update_metadata_if(self, key, fields, guard, *, require_existing: bool = False):
         if self.raises is not None:
             raise self.raises
         self.guarded_calls.append((key, dict(fields)))
+        self.required_existing.append(require_existing)
+        if require_existing and not self.exists:
+            return False
+        # The real store refuses an unreadable record before it consults the
+        # guard, so a damaged first line is a refusal rather than an exception.
+        if not self.readable:
+            return False
         if not guard(self.meta):
             return False
         self.meta.update(fields)
@@ -266,6 +315,194 @@ class TestManualTitleWins:
             _Sessions(_title_provider()), log, _KEY, "u", "a", source="telegram"
         )
         assert title == "Deploy the gateway"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# A conversation deleted during the naming turn stays deleted
+# ──────────────────────────────────────────────────────────────────────
+class TestDeletedDuringTheTurn:
+    """The naming turn is a whole LLM round trip, so a deletion can land inside
+    it. The guard alone cannot refuse that: an absent record and an untitled one
+    both reach it as an empty dict, and the merge upserts. Nor can existence
+    alone, because the session key is derived from the thread and outlives the
+    record it named, so the deleted conversation can be replaced under it. And
+    the claim, which lives in a process-wide LRU, must not outlive either."""
+
+    @pytest.mark.asyncio
+    async def test_a_session_deleted_mid_turn_is_not_recreated_as_a_title(self, audits):
+        """Mutation: drop ``require_existing=True`` at the write -- red.
+
+        Without it the empty record passes ``_record_is_untitled``, the merge
+        upserts, and the deleted conversation comes back as a sidebar row whose
+        only content is a generated name.
+        """
+        log = _Log(exists=False)  # deleted while the title was being generated
+        renamed: list[str] = []
+        title = await auto_title.maybe_auto_title(
+            _Sessions(_title_provider()),
+            log,
+            _KEY,
+            "user",
+            "assistant",
+            source="telegram",
+            set_channel_title=lambda t: _append(renamed, t),
+        )
+        assert title == ""
+        assert log.meta == {}  # nothing was written back
+        assert renamed == []  # and the channel is not named either
+
+    @pytest.mark.asyncio
+    async def test_the_write_asks_the_store_to_refuse_absence(self, audits):
+        """The opt-in reaches the store on the ordinary path too.
+
+        Mutation: drop the keyword, or pass ``require_existing=False`` -- red.
+        Asserted separately from the behaviour above because the fake could
+        refuse for its own reasons and leave that test green with the real
+        request never made.
+        """
+        log = _Log({"agent": "kirocrew"})
+        title = await auto_title.maybe_auto_title(
+            _Sessions(_title_provider()), log, _KEY, "u", "a", source="telegram"
+        )
+        assert title == "Deploy the gateway"
+        assert log.required_existing == [True]
+
+    @pytest.mark.asyncio
+    async def test_a_replacement_under_the_same_key_is_not_given_the_old_title(self, audits):
+        """Existence alone is not enough, because the key outlives the record.
+
+        A channel session key is derived from the thread, so deleting the
+        conversation and messaging that thread again mints a NEW record under the
+        SAME key. The file then exists and carries no title, so a check that asks
+        only whether the session is there lets the turn write a name derived from
+        the conversation that was deleted.
+
+        Mutation: drop the identity term from the guard (pass
+        ``_record_is_untitled``) -- red, because the replacement is untitled.
+        """
+        log = _Log(
+            {"created_at": "2026-09-20T05:00:00.100000+00:00"},
+            becomes={"created_at": "2026-09-20T05:00:31.900000+00:00"},
+        )
+        renamed: list[str] = []
+        title = await auto_title.maybe_auto_title(
+            _Sessions(_title_provider()),
+            log,
+            _KEY,
+            "user",
+            "assistant",
+            source="telegram",
+            set_channel_title=lambda t: _append(renamed, t),
+        )
+        assert title == ""
+        assert "title" not in log.meta  # the replacement keeps its own identity
+        assert renamed == []
+
+    @pytest.mark.asyncio
+    async def test_a_vanished_record_releases_the_claim(self, audits):
+        """The claim must not outlive the conversation it was taken for.
+
+        It lives in a process-wide LRU, so a claim held through a deletion
+        silences auto-titling for whatever takes the key next until the gateway
+        restarts.
+
+        Mutation: remove the ``release_claim`` call in the refusal branch -- red.
+        """
+        assert auto_title.try_claim(_KEY) is True
+        log = _Log(exists=False)
+        title = await auto_title.maybe_auto_title(
+            _Sessions(_title_provider()), log, _KEY, "u", "a", source="telegram"
+        )
+        assert title == ""
+        assert auto_title.is_titled(_KEY) is False  # a later conversation may be named
+
+    @pytest.mark.asyncio
+    async def test_a_record_without_a_creation_stamp_is_still_pinned(self, audits):
+        """A stamp-less record is not the same state as no record.
+
+        Every path that mints a metadata line stamps it from a clock, so a
+        replacement always acquires one. Requiring a stamp-less record to still
+        have none therefore pins it as firmly as a stamp pins the ordinary case.
+
+        Mutation: fold the two states together (accept anything when the stamp is
+        empty) -- red, because the replacement is untitled and the original had
+        no stamp to compare.
+        """
+        log = _Log(
+            {"agent": "kirocrew"},  # written in an older shape: no created_at
+            becomes={"agent": "kirocrew", "created_at": "2026-09-20T06:00:12.500000+00:00"},
+        )
+        renamed: list[str] = []
+        title = await auto_title.maybe_auto_title(
+            _Sessions(_title_provider()),
+            log,
+            _KEY,
+            "user",
+            "assistant",
+            source="telegram",
+            set_channel_title=lambda t: _append(renamed, t),
+        )
+        assert title == ""
+        assert "title" not in log.meta
+        assert renamed == []
+
+    @pytest.mark.asyncio
+    async def test_a_deleted_record_without_a_stamp_still_releases_the_claim(self, audits):
+        """The gone case has to be asked separately from the replaced one.
+
+        An absent record carries no stamp either, so a stamp-less record reads as
+        an identity MATCH once it is deleted, and a check that only compares
+        stamps would keep the claim on a conversation that is gone.
+
+        Mutation: drop the ``not meta`` term from the re-read -- red.
+        """
+        assert auto_title.try_claim(_KEY) is True
+        log = _Log({"agent": "kirocrew"}, becomes={})  # no stamp, then deleted
+        title = await auto_title.maybe_auto_title(
+            _Sessions(_title_provider()), log, _KEY, "u", "a", source="telegram"
+        )
+        assert title == ""
+        assert auto_title.is_titled(_KEY) is False
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_record_keeps_the_claim(self, audits):
+        """A read that did not answer is not evidence the record is gone.
+
+        The store answers a damaged first line with an empty dict and a false
+        readable flag, without raising, so a check that reads only the dict sees
+        the same value a deletion produces. Releasing the claim there bills a
+        fresh naming turn on every following exchange for as long as the record
+        stays damaged.
+
+        Mutation: read the dict alone (``get_metadata``) instead of the status --
+        red, because the empty dict reads as a deletion.
+        """
+        assert auto_title.try_claim(_KEY) is True
+        log = _Log({"created_at": "2026-09-20T06:30:00.250000+00:00"}, becomes_unreadable=True)
+        title = await auto_title.maybe_auto_title(
+            _Sessions(_title_provider()), log, _KEY, "u", "a", source="telegram"
+        )
+        assert title == ""
+        assert auto_title.is_titled(_KEY) is True  # unreadable is not a verdict
+
+    @pytest.mark.asyncio
+    async def test_a_record_that_is_already_named_keeps_the_claim(self, audits):
+        """The complement, so the release above is conditional and not blanket.
+
+        A refusal because somebody already named the conversation must KEEP the
+        claim: releasing it spends another naming turn on a conversation that
+        does not need one.
+
+        Mutation: release the claim unconditionally on refusal -- red.
+        """
+        assert auto_title.try_claim(_KEY) is True
+        log = _Log({"title": "Chosen by hand", "created_at": "2026-09-20T05:00:00.100000+00:00"})
+        title = await auto_title.maybe_auto_title(
+            _Sessions(_title_provider()), log, _KEY, "u", "a", source="telegram"
+        )
+        assert title == ""
+        assert log.meta["title"] == "Chosen by hand"  # untouched
+        assert auto_title.is_titled(_KEY) is True
 
 
 async def _append(sink: list[str], title: str) -> None:

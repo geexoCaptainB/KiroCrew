@@ -215,6 +215,116 @@ def _record_is_untitled(meta: dict) -> bool:
     return not str(meta.get("title") or "").strip()
 
 
+def _record_identity(meta: dict) -> str:
+    """The stamp that makes a record THIS record rather than a later one.
+
+    ``created_at`` is minted in the one branch of ``_update_metadata_locked``
+    that has no metadata line to merge into, and every later write merges fields
+    over the line it reads, so the value survives an ordinary metadata write and
+    changes only when the record is minted again. That is the distinction this
+    module needs.
+
+    File identity would not serve: the metadata write lands through a temporary
+    file and a rename, so the inode changes on every ordinary write and cannot
+    tell a replacement apart from a neighbour writing the record we are titling.
+    """
+    return str(meta.get("created_at") or "")
+
+
+#: The record's state as a naming turn needs it. Three values, kept distinct on
+#: purpose: PRESENT carries the creation stamp, ABSENT means there is no record
+#: to write into, and UNKNOWN means the read did not answer -- which is evidence
+#: of neither of the other two.
+RECORD_PRESENT = "present"
+RECORD_ABSENT = "absent"
+RECORD_UNKNOWN = "unknown"
+
+
+async def _read_record_state(conv_log: Any, session_key: str) -> tuple[str, str]:
+    """Return the record's state, and its creation stamp when it has one.
+
+    One read, answering completely, because every way of collapsing these three
+    states into a single value has produced a defect: an absent record reading as
+    an untitled one, a record with no stamp reading as an unpinnable one, and an
+    unreadable record reading as a deleted one.
+
+    ``get_metadata`` cannot express the third at all -- it returns only the dict
+    from ``_read_metadata_status`` and drops the readable flag beside it, so a
+    damaged first line and a deleted session are the same empty dict and neither
+    raises. ``get_metadata_status`` keeps both halves, which is why it is the one
+    read here.
+    """
+    try:
+        meta, readable = await asyncio.to_thread(conv_log.get_metadata_status, session_key)
+    except Exception:
+        logger.debug("auto-title: could not read the record for %s", session_key, exc_info=True)
+        return RECORD_UNKNOWN, ""
+    if not readable:
+        return RECORD_UNKNOWN, ""
+    if not meta:
+        return RECORD_ABSENT, ""
+    return RECORD_PRESENT, _record_identity(meta)
+
+
+def _untitled_and_still_ours(state: str, identity: str) -> Callable[[dict], bool]:
+    """Guard: untitled, AND still the record this naming turn was started for.
+
+    Existence alone is too weak. A channel session key is derived from the
+    thread, so deleting a conversation and messaging that thread again mints a
+    NEW record under the SAME key, and a turn that began before the deletion
+    would write its title -- derived from the conversation that was deleted --
+    onto the replacement. Pinning the stamp refuses that, and because the guard
+    is evaluated inside the write's own lock, neither the deletion nor the
+    replacement can land between the decision and the write.
+
+    A record with no stamp is still PRESENT, and pinning it on having no stamp is
+    as firm as a stamp: every path that mints a metadata line stamps it from a
+    clock, so a replacement always acquires one.
+
+    ABSENT and UNKNOWN are both unpinnable, and there the guard falls back to the
+    record existing, which the store's own ``require_existing`` asks for.
+    Requiring absence to persist would refuse a legitimate first write landing
+    during the turn, and an unreadable record is not evidence of anything.
+    """
+
+    def guard(meta: dict) -> bool:
+        if not _record_is_untitled(meta):
+            return False
+        if state != RECORD_PRESENT:
+            return True
+        # ``bool(meta)`` rather than leaning on the store's ``require_existing``
+        # firing first: a guard that is only correct because something upstream
+        # refuses is a guard one refactor away from being wrong.
+        return bool(meta) and _record_identity(meta) == identity
+
+    return guard
+
+
+async def _key_no_longer_names_our_record(
+    conv_log: Any, session_key: str, state: str, identity: str
+) -> bool:
+    """Whether *session_key* has stopped naming the record the turn was for.
+
+    Read after a refusal, because the refusals are not interchangeable. A record
+    that already carries a name must KEEP the claim -- releasing it would spend
+    another naming turn on a conversation somebody has already named. A record
+    that is gone, or replaced, must release it: the claim lives in a process-wide
+    LRU, so holding it silences auto-titling for whatever takes the key next, for
+    as long as this process runs.
+
+    UNKNOWN keeps the claim, and that is the whole reason the state is named
+    rather than inferred from an empty dict: an unreadable record would otherwise
+    read as a deleted one, releasing the claim and billing a fresh naming turn on
+    every following exchange for as long as the record stays damaged.
+    """
+    now_state, now_identity = await _read_record_state(conv_log, session_key)
+    if now_state == RECORD_UNKNOWN:
+        return False
+    if state != RECORD_PRESENT:
+        return now_state == RECORD_ABSENT
+    return now_state == RECORD_ABSENT or now_identity != identity
+
+
 async def _stream_title(client: Any, prompt: str, *, source: str) -> str:
     """Run *prompt* on *client*, rejecting every tool it asks for."""
     text = ""
@@ -264,6 +374,13 @@ async def maybe_auto_title(
     answer.
     """
     try:
+        # Read BEFORE the turn, because the turn IS the window: whatever the
+        # model comes back with belongs to the conversation as it stands now, and
+        # a deletion or a replacement landing later must not receive that name.
+        state = RECORD_UNKNOWN
+        identity = ""
+        if conv_log is not None:
+            state, identity = await _read_record_state(conv_log, session_key)
         prompt = build_title_prompt(
             user_text[:TITLE_INPUT_CHARS], assistant_text[:TITLE_INPUT_CHARS]
         )
@@ -293,7 +410,18 @@ async def maybe_auto_title(
                     conv_log.update_metadata_if,
                     session_key,
                     {"title": title},
-                    _record_is_untitled,
+                    _untitled_and_still_ours(state, identity),
+                    # A whole LLM turn separates the decision to name this
+                    # conversation from this write, so the session can be deleted
+                    # inside that window -- and, because a channel session key is
+                    # derived from the thread, messaging that thread again mints a
+                    # replacement under the same key. The guard cannot see either
+                    # for itself: an ABSENT record reaches it as the same empty
+                    # dict an untitled one does, and a replacement reaches it as
+                    # an untitled record. The store refuses absence inside the
+                    # write's own lock; the guard, evaluated in that same lock,
+                    # refuses a record that is not the one the turn was for.
+                    require_existing=True,
                 )
             except Exception:
                 # Best-effort: a transcript that could not be written must not
@@ -304,11 +432,29 @@ async def maybe_auto_title(
                 )
             else:
                 if not applied:
-                    # The record already carries a name. Leave BOTH it and the
-                    # channel alone: overwriting the channel title while the
+                    # Three refusals reach here: the record already carries a
+                    # name, the session was deleted during the naming turn, or
+                    # the key now names a replacement. The channel is left alone
+                    # in all three. Overwriting the channel title while the
                     # transcript keeps the user's own name would leave the two
-                    # surfaces disagreeing about what this conversation is.
-                    logger.debug("auto-title: %s already carries a title; leaving it", session_key)
+                    # surfaces disagreeing about what this conversation is;
+                    # naming a channel whose conversation is gone would show a
+                    # name for something that has no transcript behind it; and
+                    # naming a replacement would show it a name taken from a
+                    # conversation it never was.
+                    if await _key_no_longer_names_our_record(
+                        conv_log, session_key, state, identity
+                    ):
+                        # The claim names something that is not there any more,
+                        # and the claim is process-wide, so keeping it would
+                        # silence auto-titling for whatever takes this key next
+                        # until the gateway restarts. Releasing it costs one more
+                        # naming turn at most.
+                        release_claim(session_key)
+                    logger.debug(
+                        "auto-title: %s declined the title (already named, gone, or replaced)",
+                        session_key,
+                    )
                     return ""
 
         if set_channel_title is not None:
