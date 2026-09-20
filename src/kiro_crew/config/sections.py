@@ -7278,6 +7278,15 @@ class DiscordConfig:
             tags=["discord"],
         ),
     )
+    require_mention: bool = field(
+        default=False,
+        metadata=_meta(
+            "Require @mention",
+            "In an already-authorized thread/channel, only take a turn when the "
+            "message @mentions the bot; otherwise read it silently. DMs are exempt.",
+            tags=["discord"],
+        ),
+    )
     soft_threshold_pct: int = field(
         default=80,
         metadata=_meta(

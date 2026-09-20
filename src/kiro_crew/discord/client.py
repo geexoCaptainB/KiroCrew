@@ -458,6 +458,10 @@ class DiscordInbound:
     guild_id: str = ""  # empty string == DM channel
     is_bot: bool = False
     attachments: list[dict[str, Any]] = field(default_factory=list)
+    #: User snowflakes mentioned in this message (Discord's ``mentions`` array).
+    #: Captured so a transport can gate turns on whether the bot itself was
+    #: @mentioned (``discord.require_mention``); empty when nobody was tagged.
+    mention_ids: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass
@@ -1241,6 +1245,11 @@ class DiscordClient:
                     for attachment in (d.get("attachments") or [])
                     if isinstance(attachment, dict)
                 ],
+                mention_ids=frozenset(
+                    str(u.get("id", ""))
+                    for u in (d.get("mentions") or [])
+                    if isinstance(u, dict) and u.get("id")
+                ),
             )
             if inbound.is_bot or inbound.user_id == self.bot_user_id:
                 return  # never respond to bots (incl. ourselves) — loop guard

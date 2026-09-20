@@ -116,6 +116,7 @@ async def maybe_start_discord(orch: "GatewayOrchestrator") -> "DiscordClient | N
         allowed_threads: set[str] = set(getattr(orch, "_discord_allowed_thread_ids", []) or [])
         allowed_channels: set[str] = set(getattr(orch, "_discord_allowed_channel_ids", []) or [])
         auto_thread = bool(getattr(orch, "_discord_auto_thread", True))
+        require_mention = bool(getattr(orch, "_discord_require_mention", False))
         if not allowed_ids:
             logger.warning(
                 "Discord: allowed_user_ids is empty — the bot is reachable by "
@@ -149,6 +150,7 @@ async def maybe_start_discord(orch: "GatewayOrchestrator") -> "DiscordClient | N
             allowed_thread_ids=allowed_threads,
             allowed_channel_ids=allowed_channels,
             auto_thread=auto_thread,
+            require_mention=require_mention,
             on_thread_created=dispatcher.register_allowed_thread,
             dispatch=_dispatch,
         )

@@ -1838,6 +1838,123 @@ class TestTransportReceive:
         t, _, _ = self._transport(["u1"])
         assert await t.resolve_conversation("u1") == "dm-u1"
 
+    # ── require_mention gate ─────────────────────────────────────────────
+    def _mention_transport(
+        self,
+        *,
+        allowed: list[str],
+        allowed_threads: list[str] | None = None,
+        allowed_channels: list[str] | None = None,
+        require_mention: bool = True,
+        bot_user_id: str = "bot1",
+    ) -> tuple[DiscordTransport, list[InboundMessage], FakeClient]:
+        dispatched: list[InboundMessage] = []
+
+        async def _dispatch(m: InboundMessage) -> None:
+            dispatched.append(m)
+
+        client = FakeClient()
+        client.bot_user_id = bot_user_id  # type: ignore[attr-defined]
+        client.thread_channels.update(allowed_threads or [])
+        t = DiscordTransport(
+            client,  # type: ignore[arg-type]
+            allowed_user_ids=allowed,
+            allowed_thread_ids=allowed_threads or [],
+            allowed_channel_ids=allowed_channels or [],
+            require_mention=require_mention,
+            dispatch=_dispatch,
+        )
+        return t, dispatched, client
+
+    @pytest.mark.asyncio
+    async def test_require_mention_thread_without_mention_is_silent(self) -> None:
+        # Authorized user, authorized thread, but the bot is not @mentioned:
+        # the message is read (no audit event) but no turn is taken.
+        t, dispatched, _ = self._mention_transport(allowed=["u1"], allowed_threads=["t1"])
+        await t.receive(
+            DiscordInbound(channel_id="t1", user_id="u1", text="just chatting", guild_id="g1")
+        )
+        assert dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_require_mention_thread_with_mention_dispatches(self) -> None:
+        t, dispatched, _ = self._mention_transport(allowed=["u1"], allowed_threads=["t1"])
+        await t.receive(
+            DiscordInbound(
+                channel_id="t1",
+                user_id="u1",
+                text="<@bot1> status?",
+                guild_id="g1",
+                mention_ids=frozenset({"bot1"}),
+            )
+        )
+        assert len(dispatched) == 1
+        assert dispatched[0].thread_id == "t1"
+
+    @pytest.mark.asyncio
+    async def test_require_mention_dm_is_exempt(self) -> None:
+        # A DM has no guild_id, so the mention gate never applies.
+        t, dispatched, _ = self._mention_transport(allowed=["u1"])
+        await t.receive(
+            DiscordInbound(channel_id="c1", user_id="u1", text="hello", message_id="m1")
+        )
+        assert len(dispatched) == 1
+
+    @pytest.mark.asyncio
+    async def test_require_mention_gates_auto_thread_creation(self) -> None:
+        # In an allowed channel, a message without a mention must NOT spawn a
+        # thread when require_mention is on.
+        t, dispatched, client = self._mention_transport(allowed=["u1"], allowed_channels=["c1"])
+        await t.receive(
+            DiscordInbound(
+                channel_id="c1",
+                user_id="u1",
+                text="plan the release",
+                message_id="m1",
+                guild_id="g1",
+            )
+        )
+        assert client.created_threads == []
+        assert dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_require_mention_allows_auto_thread_with_mention(self) -> None:
+        t, dispatched, client = self._mention_transport(allowed=["u1"], allowed_channels=["c1"])
+        await t.receive(
+            DiscordInbound(
+                channel_id="c1",
+                user_id="u1",
+                text="<@bot1> plan the release",
+                message_id="m1",
+                guild_id="g1",
+                mention_ids=frozenset({"bot1"}),
+            )
+        )
+        assert client.created_threads == [("c1", "m1", "<@bot1> plan the release")]
+        assert len(dispatched) == 1
+
+    @pytest.mark.asyncio
+    async def test_require_mention_default_off_preserves_behavior(self) -> None:
+        # Default (require_mention=False): an authorized thread message without
+        # any mention still dispatches — no behavior change for existing users.
+        t, dispatched, _ = self._mention_transport(
+            allowed=["u1"], allowed_threads=["t1"], require_mention=False
+        )
+        await t.receive(DiscordInbound(channel_id="t1", user_id="u1", text="hello", guild_id="g1"))
+        assert len(dispatched) == 1
+
+    @pytest.mark.asyncio
+    async def test_require_mention_hot_reload_via_reconfigure(self) -> None:
+        # Starts off; a config reload flipping it on must gate the next message.
+        t, dispatched, _ = self._mention_transport(
+            allowed=["u1"], allowed_threads=["t1"], require_mention=False
+        )
+        t.reconfigure(SimpleNamespace(require_mention=True))
+        await t.receive(
+            DiscordInbound(channel_id="t1", user_id="u1", text="no ping", guild_id="g1")
+        )
+        assert dispatched == []
+
 
 # ── renderer.py streaming/finalization ───────────────────────────────────
 

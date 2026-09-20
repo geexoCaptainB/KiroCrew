@@ -3069,6 +3069,7 @@ def _build_discord_config(discord_data: dict) -> DiscordConfig:
         allowed_thread_ids=_coerce_str_ids(discord_data.get("allowed_thread_ids")),
         allowed_channel_ids=_coerce_str_ids(discord_data.get("allowed_channel_ids")),
         auto_thread=bool(discord_data.get("auto_thread", True)),
+        require_mention=bool(discord_data.get("require_mention", False)),
         soft_threshold_pct=_threshold_pct(discord_data.get("soft_threshold_pct"), 80),
         reactions_enabled=bool(discord_data.get("reactions_enabled", True)),
         show_thinking=bool(discord_data.get("show_thinking", False)),

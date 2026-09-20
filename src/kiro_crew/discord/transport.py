@@ -124,6 +124,7 @@ class DiscordTransport(MessagingTransport):
         allowed_thread_ids: Iterable[str] = (),
         allowed_channel_ids: Iterable[str] = (),
         auto_thread: bool = True,
+        require_mention: bool = False,
         on_thread_created: Callable[[str], None] | None = None,
         dispatch: DispatchFn | None = None,
     ) -> None:
@@ -144,6 +145,11 @@ class DiscordTransport(MessagingTransport):
         self._configured_threads: frozenset[str] = frozenset(self._allowed_threads)
         self._allowed_channels: frozenset[str] = frozenset(str(c) for c in allowed_channel_ids)
         self._auto_thread = auto_thread
+        # require_mention: an additional gate applied AFTER the existing user
+        # authorization. When true, an authorized user's message in an
+        # already-authorized thread/channel only starts a turn if it @mentions
+        # the bot. It never widens access — a denied user stays denied.
+        self._require_mention = require_mention
         self._on_thread_created = on_thread_created
         self._dispatch = dispatch
         self.capabilities = DISCORD_CAPABILITIES
@@ -241,6 +247,16 @@ class DiscordTransport(MessagingTransport):
         elif auto_thread != self._auto_thread:
             self._auto_thread = auto_thread
             logger.info("discord: auto_thread flipped to %r via config reload", auto_thread)
+
+        require_mention = getattr(section, "require_mention", None)
+        if not isinstance(require_mention, bool):
+            logger.warning(
+                "discord: require_mention is not a bool in the reloaded config; keeping %r",
+                self._require_mention,
+            )
+        elif require_mention != self._require_mention:
+            self._require_mention = require_mention
+            logger.info("discord: require_mention flipped to %r via config reload", require_mention)
 
     @property
     def dispatcher(self) -> Any:
@@ -402,6 +418,17 @@ class DiscordTransport(MessagingTransport):
             )
         return allowed
 
+    def _mentions_bot(self, inbound: DiscordInbound) -> bool:
+        """True when the message @mentions the bot's own user id.
+
+        Matches only a direct user mention (Discord's ``mentions`` array).
+        Role mentions (``mention_roles``) and ``@everyone`` are out of scope.
+        If the client has not learned its ``bot_user_id`` yet (pre-READY), no
+        mention can match, so the gate stays closed rather than guessing.
+        """
+        bot_id = self._client.bot_user_id
+        return bool(bot_id) and bot_id in inbound.mention_ids
+
     async def receive(self, raw_envelope: Any) -> None:
         """Normalize -> authorize -> dispatch.
 
@@ -438,6 +465,12 @@ class DiscordTransport(MessagingTransport):
                     )
                     return
                 if not self._auto_thread or not inbound.message_id:
+                    return
+                # require_mention: creating a thread is itself the bot "acting"
+                # on the message, so gate it the same way as an in-thread turn.
+                # Without a mention we read the channel message but do not spawn
+                # a thread (consistent with the in-thread branch below).
+                if self._require_mention and not self._mentions_bot(inbound):
                     return
                 # Re-check the same runtime channels-governance gate that
                 # ``DiscordDispatcher.handle_message`` enforces, but *before* the
@@ -508,6 +541,12 @@ class DiscordTransport(MessagingTransport):
                 return
             else:
                 thread_id = inbound.channel_id
+                # require_mention: in an already-authorized thread, read the
+                # message (it stays in thread context) but do not take a turn
+                # unless it @mentions the bot itself. Applied after the user
+                # authorization the allowed-threads membership already implies.
+                if self._require_mention and not self._mentions_bot(inbound):
+                    return
         msg = DiscordInboundMessage(
             channel_type="discord",
             user_id=inbound.user_id,
