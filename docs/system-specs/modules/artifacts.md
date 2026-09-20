@@ -551,10 +551,11 @@ the version would let the sweep delete freshly-iterated widgets. Conversely
 `set_pinned` / `set_folder` deliberately don't touch `updated_at`, which is why
 they are separate signals.
 
-Ordering is newest-first, re-sorted on `(updated_at, slug)` inside the sweep:
-`list()`'s `updated_at`-only sort is not a total order, so widgets registered in
-the same microsecond would otherwise tie-break by directory scan order and make
-*which* one gets deleted nondeterministic. The candidate snapshot is taken
+Ordering is newest-first in `list()`'s `(updated_at, slug)` total order: `slug`
+is unique per artifact, so widgets registered in the same microsecond have a
+defined winner instead of tie-breaking by directory scan order, and the sweep
+reads that order directly — *which* one gets deleted is deterministic with no
+sweep-local re-sort. The candidate snapshot is taken
 unlocked, so eligibility is **re-checked and the directory removed in a single
 lock acquisition** — otherwise a star landing mid-sweep would lose to a stale
 verdict and silently delete an artifact the user had just claimed. Note the sweep

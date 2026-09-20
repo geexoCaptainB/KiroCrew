@@ -328,6 +328,35 @@ class TestList:
         store.update("alpha", content="updated oldest artifact")
         assert [a.slug for a in store.list()] == ["alpha", "charlie", "bravo"]
 
+    def test_equal_timestamps_order_deterministically(
+        self, store: ArtifactStore, monkeypatch
+    ) -> None:
+        """Identical ``updated_at`` values must still yield a defined order.
+
+        ``updated_at`` alone is not a total order: without a tie-break, two
+        artifacts created in the same clock tick fall through to directory
+        scan order, which is OS-dependent (common on Windows' ~15.6ms timer).
+        The ``(updated_at, slug)`` key pins the tie to slug descending. The
+        timestamp is set explicitly — no sleeps, no reliance on clock
+        granularity.
+        """
+        from kiro_crew import artifacts
+
+        monkeypatch.setattr(artifacts, "_now_iso", lambda: "2026-01-01T00:00:00.000001+00:00")
+        # Pin the scan to ascending slug order so this test reds on every
+        # platform if the slug tie-break is removed: a stable sort over the
+        # pinned scan under an ``updated_at``-only key would return the exact
+        # reverse of the assertion below. ``iterdir()`` alone is hash-ordered
+        # on ext4/APFS, which could accidentally match the expected order.
+        orig_iter = ArtifactStore._iter_meta_paths
+        monkeypatch.setattr(
+            ArtifactStore, "_iter_meta_paths", lambda self: iter(sorted(orig_iter(self)))
+        )
+        store.create(name="apple", content="a")
+        store.create(name="mango", content="m")
+        store.create(name="zebra", content="z")
+        assert [a.slug for a in store.list()] == ["zebra", "mango", "apple"]
+
     def test_filter_by_tag(self, store: ArtifactStore) -> None:
         store.create(name="a", content="a", tags=["x"])
         store.create(name="b", content="a", tags=["y"])

@@ -2095,13 +2095,10 @@ class ArtifactStore:
         candidates = [art for art in self.list() if self._is_sweepable_auto_widget(art)]
         if len(candidates) <= keep:
             return 0
-        # ``list()`` sorts by ``updated_at`` alone, which is not a total order:
-        # two widgets registered in the same microsecond tie-break by directory
-        # scan order, making WHICH of them gets deleted nondeterministic. Re-sort
-        # on ``(updated_at, slug)`` so the kept/dropped boundary is stable and
-        # testable. Kept local to the sweep — ``list()``'s ordering is shared with
-        # the library UI and is not this change's to redefine.
-        candidates.sort(key=lambda a: (a.updated_at, a.slug), reverse=True)
+        # ``list()`` guarantees newest-first in ``(updated_at, slug)`` total
+        # order (see its docstring), and the comprehension above preserves it,
+        # so the kept/dropped boundary is already stable and testable — no
+        # re-sort needed.
         # Newest-first, so everything past `keep` is the oldest tail.
         deleted = 0
         for art in candidates[keep:]:
@@ -2359,7 +2356,9 @@ class ArtifactStore:
         touched_by_session: str | None = None,
         pinned: bool | None = None,
     ) -> _List[Artifact]:
-        """List all artifacts matching the given filters (sorted newest first).
+        """List all artifacts matching the given filters (sorted newest first;
+        equal ``updated_at`` values tie-break on ``slug`` descending, so the
+        order is a total order and stable across platforms).
 
         The lock is held only long enough to snapshot the artifact-directory
         listing; meta.json reads happen outside the lock so concurrent
@@ -2429,7 +2428,13 @@ class ArtifactStore:
             if pinned is not None and bool(art.pinned) is not pinned:
                 continue
             results.append(art)
-        results.sort(key=lambda a: a.updated_at, reverse=True)
+        # ``(updated_at, slug)`` is a genuine total order: ``slug`` is unique
+        # per artifact, so two artifacts created in the same clock tick (common
+        # on Windows, whose default timer granularity is ~15.6ms) have a
+        # defined winner instead of tie-breaking by directory scan order. The
+        # tie-break constrains only the equal-``updated_at`` case; any pair
+        # with distinct timestamps sorts purely by recency.
+        results.sort(key=lambda a: (a.updated_at, a.slug), reverse=True)
         return results
 
     def migrate_kinds(self, *, apply: bool = False) -> _List[dict[str, Any]]:

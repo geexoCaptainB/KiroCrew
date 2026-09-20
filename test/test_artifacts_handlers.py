@@ -163,9 +163,11 @@ class TestList:
         isolated_store.create(name="b", content="bb", tags=["x"])
         resp = await api_artifacts_list(_request())
         body = _json_body(resp)
-        assert len(body["artifacts"]) == 2
-        # Newest first.
-        assert body["artifacts"][0]["slug"] == "b"
+        # Newest first is now a total order: "b" wins whether the two creates
+        # got distinct timestamps ("b" is newer) or shared a clock tick (the
+        # ``(updated_at, slug)`` tie-break sorts "b" above "a"), so the full
+        # order is deterministic even on Windows' ~15.6ms timer granularity.
+        assert [a["slug"] for a in body["artifacts"]] == ["b", "a"]
         # Content is not included on list responses.
         assert "content" not in body["artifacts"][0]
 
