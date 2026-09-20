@@ -20,8 +20,17 @@
  * consent would turn on egress from a value nobody wrote for it.
  */
 
-/** The one point this build consumes an answer for. */
+/** The point that answers which skill a message loads. */
 export const DECISIONS_LIVE_POINT = 'skills.select'
+
+/** The point that answers which model tier a chat turn runs on.
+ *
+ *  Both points consume their answer, and both are reached only through a choice
+ *  the owner makes somewhere else: a non-zero `skills.max_triggered` for the
+ *  first, and the chat model picker's `Auto (Jev)` entry for this one. The switch
+ *  on this card is what lets either be asked at all, never what arms one.
+ */
+export const DECISIONS_MODEL_POINT = 'model.route'
 
 /** Config path of the sampling share; the only decisions value the config PATCH accepts. */
 export const DECISIONS_BUCKET_PATH = 'decisions.bucket'

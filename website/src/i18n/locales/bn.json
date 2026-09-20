@@ -7093,6 +7093,7 @@
     },
     "modelDropdownList": {
       "auto_default": "ডিফল্ট",
+      "auto_jev": "স্বয়ংক্রিয় (Jev)",
       "credit_multiplier": "Auto-এর তুলনায় {{value}} ক্রেডিট খরচ",
       "credit_multiplier_baseline": "{{value}}, ভিত্তি ক্রেডিট খরচ",
       "loading_models": "মডেল লোড হচ্ছে…",
@@ -10327,23 +10328,37 @@
         "dropped_label": "বাতিল",
         "error_title": "সিদ্ধান্ত ব্যর্থ হয়েছে",
         "feedback_failed": "সংরক্ষণ করা গেল না",
+        "history_chars_label": "পাঠানো প্রসঙ্গ (অক্ষর)",
         "jev_label": "Jev",
         "jev_named": "Jev: {{names}}",
         "latency_label": "Jev-এর সময়",
         "latency_title": "Jev উত্তর দিতে কত সময় নিয়েছে",
         "latency_value": "{{ms}} ms",
+        "model_baseline_label": "রাউটিং ছাড়া মডেল",
+        "model_baseline_named": "ডিফল্ট: {{model}}",
+        "model_chosen_label": "ব্যবহৃত মডেল",
+        "model_default": "অন্তর্নির্মিত ডিফল্ট",
+        "model_latency": "{{ms}} মিলিসেকেন্ড",
+        "model_not_applied": "প্রয়োগ হয়নি — {{model}}-এ চলেছে",
+        "model_tier": "Jev: {{tier}}",
+        "model_tier_label": "কঠিনতা",
+        "model_unpinned": "(নির্ধারিত নয়)",
         "no_skills": "কোনো স্কিল নয়",
+        "point_model_route": "মডেল",
         "point_skills_select": "স্কিল",
         "rate_baseline": "শব্দ মিলকরণ",
         "rate_jev": "Jev",
         "rate_right_baseline": "শব্দ মিলকরণ সঠিক স্কিল বেছেছে",
         "rate_right_jev": "Jev সঠিক স্কিল বেছেছে",
+        "rate_right_model": "Jev সঠিক মডেল বেছেছে",
         "rate_wrong_baseline": "শব্দ মিলকরণ ভুল স্কিল বেছেছে",
         "rate_wrong_jev": "Jev ভুল স্কিল বেছেছে",
+        "rate_wrong_model": "Jev ভুল মডেল বেছেছে",
         "saved_tokens": "{{tokens}} টোকেন সাশ্রয়",
         "sent_history": "ইতিহাস {{chars}} অক্ষর",
         "sent_label": "Jev-কে পাঠানো হয়েছে",
-        "sent_message": "বার্তা {{chars}} অক্ষর"
+        "sent_message": "বার্তা {{chars}} অক্ষর",
+        "truncated_turns_label": "ছেঁটে দেওয়া আগের পালা"
       }
     },
     "chatPage": {
@@ -10464,7 +10479,8 @@
       "could_not_send_to_side_chat": "সাইড চ্যাটে পাঠানো যায়নি",
       "run_in_terminal_liveness_probe_failed_error": "কমান্ডটি নতুন টার্মিনালে পাঠানো হয়নি। এর শেল হয়তো এখনও চলছে, তাই ট্যাবটি খোলা রাখা হয়েছে।",
       "run_in_terminal_shell_alive_error": "কমান্ডটি নতুন টার্মিনালে পাঠানো হয়নি, তবে এর শেল চলছে — ট্যাবটি খোলা রাখা হয়েছে যাতে আপনি সেখানে কমান্ডটি চালাতে পারেন।",
-      "run_in_terminal_dispatch_rolled_back_error": "কমান্ডটি নতুন টার্মিনালে পাঠানো হয়নি, তাই সেই টার্মিনালটি বন্ধ করা হয়েছে।"
+      "run_in_terminal_dispatch_rolled_back_error": "কমান্ডটি নতুন টার্মিনালে পাঠানো হয়নি, তাই সেই টার্মিনালটি বন্ধ করা হয়েছে।",
+      "model_auto_jev_description": "Jev প্রতিটি পালার কঠিনতা বিচার করে সেই স্তরের মডেলে চালাবে"
     },
     "chatSidebar": {
       "1_skipped_currently_selected": "(1টি এড়িয়ে যাওয়া হয়েছে — এখন বেছে নেওয়া আছে)",

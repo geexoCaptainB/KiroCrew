@@ -569,8 +569,10 @@ class TestGovernanceWithdrawsTheSeam:
 
 
 class TestPointName:
-    def test_the_shipped_vocabulary_is_one_point(self):
-        assert DECISION_POINT_NAMES == ("skills.select",)
+    def test_the_shipped_vocabulary_is_the_two_points(self):
+        """A CLOSED tuple: a name outside it is refused, so a point added without
+        being listed here refuses every call rather than borrowing the switch."""
+        assert DECISION_POINT_NAMES == ("skills.select", "model.route")
 
     @pytest.mark.parametrize("unknown", ["skills.dedupe", "cron.novelty", "", "skills.Select"])
     def test_an_unknown_point_is_refused_even_when_enabled(

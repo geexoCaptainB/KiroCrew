@@ -3315,6 +3315,9 @@
     },
     "pierreEditorImpl": {
       "highlighting_unavailable_with_reason": "Syntax highlighting is unavailable until you reload. Content remains readable. Last failure: {{classification}} (generation {{generation}}, attempt {{attempt}}): {{reason}}"
+    },
+    "modelDropdownList": {
+      "auto_jev": "Auto (Jev)"
     }
   },
   "hooks": {
@@ -4244,23 +4247,37 @@
         "dropped_label": "Refused",
         "error_title": "Decision failed",
         "feedback_failed": "Could not save that",
+        "history_chars_label": "Context sent (characters)",
         "jev_label": "Jev",
         "jev_named": "Jev: {{names}}",
         "latency_label": "Jev latency",
         "latency_title": "How long Jev took to answer",
         "latency_value": "{{ms}} ms",
+        "model_baseline_label": "Model without routing",
+        "model_baseline_named": "default: {{model}}",
+        "model_chosen_label": "Model used",
+        "model_default": "Built-in default",
+        "model_latency": "{{ms}} ms",
+        "model_not_applied": "not applied — ran on {{model}}",
+        "model_tier": "Jev: {{tier}}",
+        "model_tier_label": "Difficulty",
+        "model_unpinned": "(unpinned)",
         "no_skills": "no skills",
+        "point_model_route": "model",
         "point_skills_select": "skills",
         "rate_baseline": "Word match",
         "rate_jev": "Jev",
         "rate_right_baseline": "Word match picked the right skills",
         "rate_right_jev": "Jev picked the right skills",
+        "rate_right_model": "Jev picked the right model",
         "rate_wrong_baseline": "Word match picked the wrong skills",
         "rate_wrong_jev": "Jev picked the wrong skills",
+        "rate_wrong_model": "Jev picked the wrong model",
         "saved_tokens": "saved {{tokens}} tokens",
         "sent_history": "history {{chars}} chars",
         "sent_label": "Sent to Jev",
-        "sent_message": "message {{chars}} chars"
+        "sent_message": "message {{chars}} chars",
+        "truncated_turns_label": "Earlier turns cut short"
       }
     },
     "chatPage": {
@@ -4330,7 +4347,8 @@
       "could_not_send_to_side_chat": "Couldn't send to the side chat",
       "run_in_terminal_liveness_probe_failed_error": "The command wasn't sent to the new terminal. Its shell may still be running, so the tab was left open.",
       "run_in_terminal_shell_alive_error": "The command wasn't sent to the new terminal, but its shell is running — the tab was left open so you can run the command there.",
-      "run_in_terminal_dispatch_rolled_back_error": "The command wasn't sent to the new terminal, so that terminal was closed."
+      "run_in_terminal_dispatch_rolled_back_error": "The command wasn't sent to the new terminal, so that terminal was closed.",
+      "model_auto_jev_description": "Let Jev judge each turn and run it on the model for that tier"
     },
     "chatSidebar": {
       "adopt_failed": "Could not open this session here.",

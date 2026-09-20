@@ -141,14 +141,40 @@ class TestDecisionsSettingCrossLayer:
         assert callable(handlers.api_decisions_consent_get)
         assert callable(handlers.api_decisions_consent_put)
 
-    def test_the_frontend_live_point_is_a_point_the_backend_ships(self):
+    def test_the_frontend_and_backend_name_the_same_points(self):
+        """Both directions, because each one breaks a different surface.
+
+        A point the FRONTEND names but the backend does not ship is a reader
+        waiting for a record nothing writes. A point the BACKEND ships but the
+        frontend cannot name draws nothing at all -- ``decisionRecord.ts``
+        dispatches on the record's own ``point`` and returns null for one it does
+        not know, so that direction fails silently and looks exactly like a healthy
+        release stamping no record.
+
+        The frontend side is DISCOVERED, not listed: every ``DECISIONS_*_POINT``
+        constant the reader exports. So shipping a third point is one constant in
+        ``decisionsPreview.ts`` and no edit here -- which also keeps two branches
+        each adding a point from colliding on this file.
+
+        Discovery is asserted non-empty and anchored on the skills point, because a
+        scan that silently matched nothing would pass while measuring nothing.
+        """
         from kiro_crew.decisions.gate import DECISION_POINT_NAMES
 
-        point = _ts_const(DECISIONS_READER_PATH.read_text(encoding="utf-8"), "DECISIONS_LIVE_POINT")
+        source = DECISIONS_READER_PATH.read_text(encoding="utf-8")
+        names = re.findall(r"export const (DECISIONS_\w+_POINT)\b", source)
+        assert names, (
+            "no DECISIONS_*_POINT constant found in decisionsPreview.ts -- the "
+            "discovery pattern no longer matches how the reader spells a point, so "
+            "this assertion would compare nothing"
+        )
+        frontend = {_ts_const(source, name) for name in names}
         assert (
-            point,
-        ) == DECISION_POINT_NAMES, (
-            f"the card's point {point!r} differs from backend point names {DECISION_POINT_NAMES}"
+            "skills.select" in frontend
+        ), f"the reader stopped naming the skills point (found {sorted(frontend)})"
+        assert frontend == set(DECISION_POINT_NAMES), (
+            f"the reader names {sorted(frontend)} while the backend ships "
+            f"{sorted(DECISION_POINT_NAMES)}"
         )
 
 

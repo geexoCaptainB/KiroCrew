@@ -42,6 +42,7 @@ import { useAnchoredTriggerRect } from '../hooks/useAnchoredTriggerRect'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
 import { useAvailableModels } from '../hooks/useAvailableModels'
 import { filterInteractiveModels, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
+import { JEV_ROUTE_MODEL, jevRouteOffered, jevRouteShownModel, withJevRoute } from '../lib/jevRoute'
 import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutation'
 import { useQueuedMessageActions, queuedSendStash } from '../hooks/useQueuedMessageActions'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
@@ -399,7 +400,7 @@ export default function ChatPane({
   useEffect(() => { setFollowUpPicked(new Set()) }, [followUpOptionsKey, slotKey])
   // Quick Send parity with ChatPage: same query key, so the cache is shared
   // with the page and no extra request is made for a pane.
-  const { data: dashCfg } = useQuery<{ quick_send?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: () => api.dashboardConfig(), staleTime: 30_000 })
+  const { data: dashCfg } = useQuery<{ quick_send?: boolean; decisions_enabled?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: () => api.dashboardConfig(), staleTime: 30_000 })
   // Follow-up bar layout: the same persisted setting ChatPage reads, kept live
   // the same way (ChatPage.tsx's reload listener) — a pane is long-lived, so a
   // one-shot read would leave it on the old layout after the user changes the
@@ -474,12 +475,31 @@ export default function ChatPane({
   const hiddenModelIds = hiddenModelsQ.data
   const modelPickerConfigured = useModelPickerConfigured()
   const availableModels = effectiveModels
+  // Same two reads and the same fail-closed rule as ChatPage: a split pane is
+  // another view of the same sessions, so it offers the same row or the picker
+  // would disagree with itself about whether routing is available. The dashboard
+  // config comes from this component's EXISTING observer (widened above) rather
+  // than a second one on the same key.
+  const jevConsentQ = useQuery({
+    queryKey: ['decisionsConsent'],
+    queryFn: () => api.getDecisionsConsent(),
+    retry: false,
+  })
+  // Not offered for a remote-bound session, for the reason ChatPage states: its
+  // turns run on the peer and never reach the routing hook.
+  const jevRouteOn =
+    jevRouteOffered(dashCfg, jevConsentQ.data, !!paneSlot) && !paneRemoteCrew.isRemote
+  const jevRouteLabel = i18nT('pages.chatPage.model_auto_jev_description')
   const modelPickerModels = useMemo(
-    () => filterInteractiveModels(effectiveModels, hiddenModelIds, [
-      paneSlot?.model || '',
-      paneSlot?.served_model || '',
-    ]),
-    [effectiveModels, hiddenModelIds, paneSlot?.model, paneSlot?.served_model],
+    () => withJevRoute(
+      filterInteractiveModels(effectiveModels, hiddenModelIds, [
+        paneSlot?.model || '',
+        paneSlot?.served_model || '',
+      ]),
+      jevRouteOn,
+      jevRouteLabel,
+    ),
+    [effectiveModels, hiddenModelIds, paneSlot?.model, paneSlot?.served_model, jevRouteOn, jevRouteLabel],
   )
   const modelDD = useFilteredDropdown(modelPickerModels)
   // Picker anchors: keep each portaled menu glued to the ChatInput chip that
@@ -564,7 +584,15 @@ export default function ChatPane({
           const r = await api.chatSlotModel(slotKey, name)
           return r?.model ?? name
         },
-        (value) => dispatch(updateSlot({ key: slotKey, model: value })))
+          // The routing flag is written from the REQUEST, not from the response's
+          // `model`: the gateway resolves the sentinel to `auto`, so the stored
+          // model cannot tell a routed pick from a plain Auto one. Written on
+          // every pick, because picking a concrete model is what clears it.
+        (value) => dispatch(updateSlot({
+          key: slotKey,
+          model: value,
+          jev_route: name === JEV_ROUTE_MODEL,
+        })))
     } catch (e) {
       // Same failure surface as switchAgent above: the shared notice toast,
       // plus the in-pane notice (the toast alone would be the only report of
@@ -1754,7 +1782,7 @@ export default function ChatPane({
               </div>
             )}
             <div role="listbox" aria-label={i18nT('components.chatPane.model_list')} className="overflow-y-auto max-h-[280px]">
-              <ModelDropdownList models={modelDD.filtered} activeModel={shownModel} onSelect={(name) => { switchModel(name); modelDD.setOpen(false) }} loading={paneRemoteCrew.modelsPending} failed={paneRemoteCrew.failed} />
+              <ModelDropdownList models={modelDD.filtered} activeModel={jevRouteShownModel(shownModel, paneSlot)} onSelect={(name) => { switchModel(name); modelDD.setOpen(false) }} loading={paneRemoteCrew.modelsPending} failed={paneRemoteCrew.failed} />
             </div>
             {!modelPickerConfigured && <ManageModelsFooter onManage={() => {
               modelDD.setOpen(false)
