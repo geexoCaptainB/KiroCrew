@@ -340,6 +340,18 @@ class SessionProjections:
     #: when no log existed (the empty bundle) and never matches a real file.
     origin: str | None = None
 
+    #: The file size captured by the same stat call as ``origin``. A reusable
+    #: bundle may skip walking the log only while this still matches; ``None``
+    #: keeps bundles created before this field safe by forcing one validating
+    #: walk before their next O(1) poll.
+    size: int | None = None
+
+    #: The file modification time captured by the same stat call as ``origin``
+    #: and ``size``. It detects an in-place same-size rewrite that size alone
+    #: cannot distinguish; ``None`` keeps older bundles safe by forcing one
+    #: validating walk.
+    mtime_ns: int | None = None
+
     def projection(self, name: str) -> Projection:
         """One rendered projection, or raise ``bad_data`` for an unknown name."""
         return projection_of(self.checkpoints[require_name(name)])
@@ -376,8 +388,8 @@ def open_session_log(session_id: str) -> CrewLog | None:
     return CrewLog.open(KIND_SESSION, session_id)
 
 
-def _log_origin(handle: CrewLog) -> str | None:
-    """The crew log file's creation identity for *handle*, or ``None``.
+def _log_identity(handle: CrewLog) -> tuple[str | None, int | None, int | None]:
+    """The crew log file's creation identity, size and mtime from one stat call.
 
     A reuse (:func:`fold_session` ``since=``) folds new bytes onto a cached
     checkpoint only when the file it folds now is the SAME one the checkpoint
@@ -389,16 +401,19 @@ def _log_origin(handle: CrewLog) -> str | None:
     only colliding case -- itself near-impossible). This catches what the seq
     guard cannot: a recreated log that has already grown PAST the cached seq.
     ``None`` is "unknown identity" and never matches, so a header without the
-    field or a stat failure falls back to the safe full rebuild.
+    field or a stat failure falls back to the safe full rebuild. Size and mtime
+    together also prevent a same-size in-place rewrite from taking the unchanged
+    fast path. A successful stat still returns both when the header lacks
+    ``created_at``.
     """
-    created_at = getattr(handle.header, "created_at", None)
-    if not isinstance(created_at, int) or isinstance(created_at, bool):
-        return None
     try:
         stat = handle.path.stat()
     except OSError:
-        return None
-    return f"{created_at}:{stat.st_dev}:{stat.st_ino}"
+        return None, None, None
+    created_at = getattr(handle.header, "created_at", None)
+    if not isinstance(created_at, int) or isinstance(created_at, bool):
+        return None, stat.st_size, stat.st_mtime_ns
+    return f"{created_at}:{stat.st_dev}:{stat.st_ino}", stat.st_size, stat.st_mtime_ns
 
 
 def fold_session(
@@ -426,7 +441,7 @@ def fold_session(
     if handle is None:
         return empty_session(session_id, wanted)
     last_seq = handle.last_seq
-    origin = _log_origin(handle)
+    origin, size, mtime_ns = _log_identity(handle)
     reusable = (
         since is not None
         and since.session_id == session_id
@@ -446,9 +461,22 @@ def fold_session(
         else {name: initial(name) for name in wanted}
     )
     from_seq = min((cp.last_seq for cp in base.values()), default=0) + 1
-    if from_seq > last_seq:
+    if (
+        from_seq > last_seq
+        and reusable
+        and since is not None
+        and since.size is not None
+        and since.size == size
+        and since.mtime_ns is not None
+        and since.mtime_ns == mtime_ns
+    ):
         return SessionProjections(
-            session_id=session_id, last_seq=last_seq, checkpoints=base, origin=origin
+            session_id=session_id,
+            last_seq=last_seq,
+            checkpoints=base,
+            origin=origin,
+            size=size,
+            mtime_ns=mtime_ns,
         )
     # ONE pass over the file, in bounded chunks. Five folds consume the same
     # entries, so a bare generator would be exhausted by the first of them and
@@ -470,7 +498,12 @@ def fold_session(
         grown = _advance_all(grown, chunk)
     reached = max((cp.last_seq for cp in grown.values()), default=last_seq)
     return SessionProjections(
-        session_id=session_id, last_seq=reached, checkpoints=grown, origin=origin
+        session_id=session_id,
+        last_seq=reached,
+        checkpoints=grown,
+        origin=origin,
+        size=size,
+        mtime_ns=mtime_ns,
     )
 
 
