@@ -9339,6 +9339,7 @@
       "back_to_live": "লাইভে ফিরে যান",
       "versions_failed_to_load": "সংস্করণ লোড করা যায়নি",
       "comments_failed_to_load": "মন্তব্য লোড করা যায়নি",
+      "couldn_t_send_your_comments_are_still_pending": "পাঠানো যায়নি — তোমার মন্তব্যগুলি এখনও অপেক্ষমাণ।",
       "comment_action_failed": "মন্তব্যের কাজ ব্যর্থ",
       "activity_failed_to_load": "কার্যকলাপ লোড করা যায়নি",
       "sync_status_unavailable": "সিঙ্ক অবস্থা অনুপলব্ধ"

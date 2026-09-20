@@ -9212,6 +9212,7 @@
       "back_to_live": "返回实时版本",
       "versions_failed_to_load": "版本加载失败",
       "comments_failed_to_load": "评论加载失败",
+      "couldn_t_send_your_comments_are_still_pending": "没能发送——你的评论仍在等待发送。",
       "comment_action_failed": "评论操作失败",
       "activity_failed_to_load": "活动记录加载失败",
       "sync_status_unavailable": "同步状态不可用"

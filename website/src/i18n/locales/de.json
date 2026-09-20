@@ -9339,6 +9339,7 @@
       "back_to_live": "Zurück zur Live-Version",
       "versions_failed_to_load": "Versionen konnten nicht geladen werden",
       "comments_failed_to_load": "Kommentare konnten nicht geladen werden",
+      "couldn_t_send_your_comments_are_still_pending": "Senden nicht möglich – deine Kommentare sind weiterhin ausstehend.",
       "comment_action_failed": "Kommentaraktion fehlgeschlagen",
       "activity_failed_to_load": "Aktivität konnte nicht geladen werden",
       "sync_status_unavailable": "Synchronisierungsstatus nicht verfügbar"

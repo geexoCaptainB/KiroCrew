@@ -9212,6 +9212,7 @@
       "back_to_live": "라이브로 돌아가기",
       "versions_failed_to_load": "버전을 불러오지 못했습니다",
       "comments_failed_to_load": "댓글을 불러오지 못했습니다",
+      "couldn_t_send_your_comments_are_still_pending": "보내지 못했습니다. 댓글은 아직 대기 중입니다.",
       "comment_action_failed": "댓글 작업 실패",
       "activity_failed_to_load": "활동을 불러오지 못했습니다",
       "sync_status_unavailable": "동기화 상태를 확인할 수 없습니다"

@@ -9466,6 +9466,7 @@
       "back_to_live": "Retour à la version en direct",
       "versions_failed_to_load": "Échec du chargement des versions",
       "comments_failed_to_load": "Échec du chargement des commentaires",
+      "couldn_t_send_your_comments_are_still_pending": "Envoi impossible : vos commentaires sont toujours en attente.",
       "comment_action_failed": "Échec de l'action sur le commentaire",
       "activity_failed_to_load": "Échec du chargement de l'activité",
       "sync_status_unavailable": "État de synchronisation indisponible"

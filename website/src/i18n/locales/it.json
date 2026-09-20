@@ -9466,6 +9466,7 @@
       "back_to_live": "Torna alla versione live",
       "versions_failed_to_load": "Caricamento delle versioni non riuscito",
       "comments_failed_to_load": "Caricamento dei commenti non riuscito",
+      "couldn_t_send_your_comments_are_still_pending": "Invio non riuscito: i tuoi commenti sono ancora in attesa.",
       "comment_action_failed": "Azione sul commento non riuscita",
       "activity_failed_to_load": "Caricamento dell'attività non riuscito",
       "sync_status_unavailable": "Stato di sincronizzazione non disponibile"

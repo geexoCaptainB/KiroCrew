@@ -9212,6 +9212,7 @@
       "back_to_live": "ライブに戻る",
       "versions_failed_to_load": "バージョンの読み込みに失敗しました",
       "comments_failed_to_load": "コメントの読み込みに失敗しました",
+      "couldn_t_send_your_comments_are_still_pending": "送信できませんでした。コメントはまだ保留中です。",
       "comment_action_failed": "コメント操作に失敗しました",
       "activity_failed_to_load": "アクティビティの読み込みに失敗しました",
       "sync_status_unavailable": "同期状態を取得できません"

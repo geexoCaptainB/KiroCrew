@@ -9593,6 +9593,7 @@
       "back_to_live": "Вернуться к текущей версии",
       "versions_failed_to_load": "Не удалось загрузить версии",
       "comments_failed_to_load": "Не удалось загрузить комментарии",
+      "couldn_t_send_your_comments_are_still_pending": "Не удалось отправить — ваши комментарии всё ещё ожидают отправки.",
       "comment_action_failed": "Действие с комментарием не выполнено",
       "activity_failed_to_load": "Не удалось загрузить активность",
       "sync_status_unavailable": "Статус синхронизации недоступен"

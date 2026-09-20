@@ -9339,6 +9339,7 @@
       "back_to_live": "लाइव पर वापस जाएँ",
       "versions_failed_to_load": "संस्करण लोड करने में विफल",
       "comments_failed_to_load": "टिप्पणियाँ लोड करने में विफल",
+      "couldn_t_send_your_comments_are_still_pending": "भेजा नहीं जा सका — तुम्हारी टिप्पणियाँ अभी भी लंबित हैं।",
       "comment_action_failed": "टिप्पणी कार्रवाई विफल",
       "activity_failed_to_load": "गतिविधि लोड करने में विफल",
       "sync_status_unavailable": "सिंक स्थिति उपलब्ध नहीं"

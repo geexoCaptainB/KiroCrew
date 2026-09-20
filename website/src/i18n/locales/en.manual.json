@@ -3627,6 +3627,7 @@
       "back_to_live": "Back to Live",
       "versions_failed_to_load": "Versions failed to load",
       "comments_failed_to_load": "Comments failed to load",
+      "couldn_t_send_your_comments_are_still_pending": "Couldn't send — your comments are still pending.",
       "comment_action_failed": "Comment action failed",
       "activity_failed_to_load": "Activity failed to load",
       "sync_status_unavailable": "Sync status unavailable"
