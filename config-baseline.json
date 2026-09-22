@@ -5851,6 +5851,8 @@
         "allowed_thread_ids": [],
         "allowed_channel_ids": [],
         "auto_thread": true,
+        "require_mention": false,
+        "allowed_bot_ids": [],
         "soft_threshold_pct": 80,
         "reactions_enabled": true,
         "show_thinking": false,
@@ -5994,6 +5996,52 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true
+    },
+    {
+      "path": "discord.require_mention",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "discord"
+      ],
+      "label": "Require @mention",
+      "help": "In an already-authorized thread/channel, only take a turn when the message @mentions the bot; otherwise read it silently. DMs are exempt.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
+      "path": "discord.allowed_bot_ids",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "discord"
+      ],
+      "label": "Allowed Bot IDs",
+      "help": "Discord user IDs of OTHER bots explicitly allowed to start a turn (inter-agent comms). Empty = ignore all bots (historical loop-guard). A listed bot must ALSO be in allowed_user_ids to pass deny-by-default.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "discord.allowed_bot_ids.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
     },
     {
       "path": "discord.soft_threshold_pct",

@@ -7287,6 +7287,16 @@ class DiscordConfig:
             tags=["discord"],
         ),
     )
+    allowed_bot_ids: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Allowed Bot IDs",
+            "Discord user IDs of OTHER bots explicitly allowed to start a turn "
+            "(inter-agent comms). Empty = ignore all bots (historical loop-guard). "
+            "A listed bot must ALSO be in allowed_user_ids to pass deny-by-default.",
+            tags=["discord"],
+        ),
+    )
     soft_threshold_pct: int = field(
         default=80,
         metadata=_meta(

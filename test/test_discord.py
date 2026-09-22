@@ -4700,3 +4700,72 @@ class TestPerTurnConfigReadIsOffLoop:
         with mock.patch.object(td_mod.asyncio, "to_thread", _spy):
             await d.handle_message(_inbound("hi"))
         assert "_render_config" in offloaded
+
+
+# ── issue #55: allowed_bot_ids perforates the is_bot loop-guard ───────────
+
+
+class TestAllowedBotIdsLoopGuard:
+    """MESSAGE_CREATE loop-guard with the inter-agent allowlist (issue #55)."""
+
+    @staticmethod
+    async def _dispatch_from(
+        client: DiscordClient, *, user_id: str, is_bot: bool
+    ) -> list[DiscordInbound]:
+        captured: list[DiscordInbound] = []
+
+        async def _capture(inbound: DiscordInbound) -> None:
+            captured.append(inbound)
+
+        client.set_message_handler(_capture)
+        client._on_dispatch(
+            "MESSAGE_CREATE",
+            {
+                "channel_id": "c1",
+                "id": "m1",
+                "content": "hola",
+                "author": {"id": user_id, "username": "peer", "bot": is_bot},
+            },
+        )
+        tasks = tuple(client._handler_tasks)
+        if tasks:
+            await asyncio.gather(*tasks)
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_bot_is_processed(self) -> None:
+        client = DiscordClient(token="t", allowed_bot_ids=["1550948340970295447"])
+        captured = await self._dispatch_from(
+            client, user_id="1550948340970295447", is_bot=True
+        )
+        assert len(captured) == 1
+        assert captured[0].user_id == "1550948340970295447"
+        assert captured[0].is_bot is True
+
+    @pytest.mark.asyncio
+    async def test_non_allowlisted_bot_is_dropped(self) -> None:
+        client = DiscordClient(token="t", allowed_bot_ids=["1550948340970295447"])
+        captured = await self._dispatch_from(client, user_id="999999", is_bot=True)
+        assert captured == []
+
+    @pytest.mark.asyncio
+    async def test_empty_allowlist_drops_all_bots(self) -> None:
+        # Default (empty) preserves the historical "ignore all bots" guard.
+        client = DiscordClient(token="t")
+        captured = await self._dispatch_from(client, user_id="123", is_bot=True)
+        assert captured == []
+
+    @pytest.mark.asyncio
+    async def test_own_echo_dropped_even_if_allowlisted(self) -> None:
+        # user_id == bot_user_id is ALWAYS dropped, even when in the allowlist.
+        client = DiscordClient(token="t", allowed_bot_ids=["self-id"])
+        client.bot_user_id = "self-id"
+        captured = await self._dispatch_from(client, user_id="self-id", is_bot=True)
+        assert captured == []
+
+    @pytest.mark.asyncio
+    async def test_human_still_processed_with_allowlist_set(self) -> None:
+        client = DiscordClient(token="t", allowed_bot_ids=["1550948340970295447"])
+        captured = await self._dispatch_from(client, user_id="human-1", is_bot=False)
+        assert len(captured) == 1
+        assert captured[0].is_bot is False

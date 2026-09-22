@@ -38,7 +38,7 @@ import re
 import time
 import urllib.parse
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, TypeVar
@@ -516,6 +516,7 @@ class DiscordClient:
         on_interaction: Callable[[DiscordInteraction], Awaitable[None]] | None = None,
         enable_guild_threads: bool = False,
         proxy: str | None = None,
+        allowed_bot_ids: Iterable[str] = (),
     ) -> None:
         self._token = token
         self._on_message = on_message
@@ -537,6 +538,11 @@ class DiscordClient:
         self._handler_tasks: set[asyncio.Task[None]] = set()
         # Bot's own user id (from READY) so we can drop our own messages.
         self.bot_user_id: str = ""
+        # User ids of OTHER bots explicitly allowed to start a turn (issue #55).
+        # Empty (default) preserves the historical "ignore all bots" guard.
+        self._allowed_bot_ids: frozenset[str] = frozenset(
+            str(b) for b in (allowed_bot_ids or ())
+        )
         # Application id (from READY) — the path parameter for application
         # command registration. Empty until the first handshake completes.
         self.application_id: str = ""
@@ -1251,8 +1257,12 @@ class DiscordClient:
                     if isinstance(u, dict) and u.get("id")
                 ),
             )
-            if inbound.is_bot or inbound.user_id == self.bot_user_id:
-                return  # never respond to bots (incl. ourselves) — loop guard
+            # Always drop our own echo. Drop other bots UNLESS explicitly
+            # allow-listed for inter-agent communication (issue #55).
+            if inbound.user_id == self.bot_user_id:
+                return
+            if inbound.is_bot and inbound.user_id not in self._allowed_bot_ids:
+                return  # ignore non-allowlisted bots — loop guard
             task = asyncio.create_task(self._invoke_message(inbound))
             self._handler_tasks.add(task)
             task.add_done_callback(self._handler_tasks.discard)

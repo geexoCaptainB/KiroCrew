@@ -13859,6 +13859,9 @@ class GatewayOrchestrator:
         ]
         self._discord_auto_thread = bool(cfg.discord.auto_thread)
         self._discord_require_mention = bool(cfg.discord.require_mention)
+        self._discord_allowed_bot_ids: list[str] = [
+            str(b) for b in cfg.discord.allowed_bot_ids
+        ]
         self._discord_client: "DiscordClient | None" = None
 
     def _hoist_webex(self, cfg: KiroCrewConfig, creds: Mapping[str, str]) -> None:
