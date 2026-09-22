@@ -509,3 +509,53 @@ class TestDiscordConfigToggles:
         paths = {entry.path: entry for entry in SCHEMA_REGISTRY}
         assert paths["discord.reactions_enabled"].default_value is True
         assert paths["discord.show_thinking"].default_value is False
+
+
+# ── issue #55 (outbound): allow-listed bot mentions survive the ZWSP guard ───
+
+
+class TestMentionNeutralizationAllowlist:
+    """_redact_transformed inserts a ZWSP into mentions so model text cannot
+    ping — EXCEPT user mentions of allow-listed bots, which must stay real so
+    inter-agent pings wake the peer (issue #55, outbound)."""
+
+    HERMES = "1550948340970295447"
+    ZWSP = "\u200b"
+
+    def test_empty_allowlist_neutralizes_everything(self) -> None:
+        out = renderer_mod._redact_transformed(f"<@{self.HERMES}> hi")
+        assert self.ZWSP in out  # historical blanket behavior
+
+    def test_allowlisted_bot_mention_kept_real(self) -> None:
+        out = renderer_mod._redact_transformed(
+            f"<@{self.HERMES}> tomá el turno", frozenset({self.HERMES})
+        )
+        assert out == f"<@{self.HERMES}> tomá el turno"
+        assert self.ZWSP not in out
+
+    def test_allowlisted_bang_form_kept_real(self) -> None:
+        out = renderer_mod._redact_transformed(
+            f"<@!{self.HERMES}> hi", frozenset({self.HERMES})
+        )
+        assert out == f"<@!{self.HERMES}> hi"
+
+    def test_everyone_still_neutralized_with_allowlist(self) -> None:
+        out = renderer_mod._redact_transformed("@everyone hi", frozenset({self.HERMES}))
+        assert self.ZWSP in out
+
+    def test_role_mention_still_neutralized(self) -> None:
+        out = renderer_mod._redact_transformed("<@&123456> hi", frozenset({self.HERMES}))
+        assert self.ZWSP in out
+
+    def test_non_allowlisted_user_still_neutralized(self) -> None:
+        out = renderer_mod._redact_transformed("<@999999999> hi", frozenset({self.HERMES}))
+        assert self.ZWSP in out
+
+    def test_mixed_message_only_allowlisted_survives(self) -> None:
+        out = renderer_mod._redact_transformed(
+            f"@everyone <@999999999> <@{self.HERMES}>", frozenset({self.HERMES})
+        )
+        # the allow-listed one is intact; the other two carry a ZWSP
+        assert f"<@{self.HERMES}>" in out
+        assert f"<@{self.ZWSP}999999999>" in out
+        assert f"@{self.ZWSP}everyone" in out

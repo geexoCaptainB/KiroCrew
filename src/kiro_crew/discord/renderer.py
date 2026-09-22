@@ -109,6 +109,41 @@ _UPLOAD_LIMITS = ExtractLimits(
 
 _MAX_REJECTION_LINES = 3
 _DISCORD_MENTION_AT_RE = re.compile(r"(?:(?<=<)@(?=[!&]?\d+>)|(?<!\w)@(?=(?i:everyone|here)\b))")
+# Captures a USER mention token so we can decide per-id whether to neutralize
+# it. Group 1 is the snowflake. Role mentions (<@&id>) are intentionally NOT
+# matched here — those are always neutralized by _DISCORD_MENTION_AT_RE.
+_DISCORD_USER_MENTION_RE = re.compile(r"<@!?(\d+)>")
+
+
+def _neutralize_mentions(text: str, allowed_bot_ids: frozenset[str]) -> str:
+    """Insert a zero-width space after ``<`` in every mention so it renders as
+    text without pinging — EXCEPT user mentions of allow-listed bot ids, which
+    must stay real so inter-agent pings actually wake the peer (issue #55).
+
+    ``@everyone``/``@here``/roles and any non-allow-listed user id are still
+    neutralized. Empty ``allowed_bot_ids`` (default) reproduces the historical
+    blanket behavior exactly.
+    """
+    if not allowed_bot_ids:
+        return _DISCORD_MENTION_AT_RE.sub("@\u200b", text)
+
+    # Protect allow-listed user mentions first with a placeholder the blanket
+    # regex cannot match, neutralize everything else, then restore them.
+    protected: dict[str, str] = {}
+
+    def _protect(m: "re.Match[str]") -> str:
+        uid = m.group(1)
+        if uid in allowed_bot_ids:
+            key = f"\x00{len(protected)}\x00"
+            protected[key] = m.group(0)
+            return key
+        return m.group(0)
+
+    staged = _DISCORD_USER_MENTION_RE.sub(_protect, text)
+    staged = _DISCORD_MENTION_AT_RE.sub("@\u200b", staged)
+    for key, original in protected.items():
+        staged = staged.replace(key, original)
+    return staged
 
 
 def _redact_all(text: str) -> str:
@@ -116,9 +151,9 @@ def _redact_all(text: str) -> str:
     return redact_credentials(text)[0]
 
 
-def _redact_transformed(text: str) -> str:
+def _redact_transformed(text: str, allowed_bot_ids: frozenset[str] = frozenset()) -> str:
     text, _ = redact_for_display(text, _redact_all)
-    return _DISCORD_MENTION_AT_RE.sub("@\u200b", text)
+    return _neutralize_mentions(text, allowed_bot_ids)
 
 
 # Discord's typing indicator lasts ~10s per trigger; refresh just under that
@@ -877,7 +912,7 @@ class DiscordRenderer(Renderer):
         # off streamed model text to Discord with only the LITERAL-form redaction
         # ``TurnDriver`` applies — and the display pass exists precisely for the
         # credential that is invisible until Discord renders the markdown away.
-        body = _redact_transformed(body)
+        body = _redact_transformed(body, getattr(self._client, "_allowed_bot_ids", frozenset()))
         footer = f"-# 🔧 {self._tool}…" if self._tool else ""
         if footer:
             room = self._limit() - len(footer) - 2
@@ -930,7 +965,7 @@ class DiscordRenderer(Renderer):
             body = text
         if result.rejections:
             body = self._append_rejections(body, result.rejections)
-        body = _redact_transformed(body)
+        body = _redact_transformed(body, getattr(self._client, "_allowed_bot_ids", frozenset()))
         if result.files:
             sel().log_api_access(
                 caller=self._session_key or "discord",
@@ -1026,7 +1061,7 @@ class DiscordRenderer(Renderer):
             # display pass is a floor rather than a consequence of extracting
             # files. Skipping it here let a markdown-split credential reach a
             # guild thread that only the literal-form redactor had seen.
-            text = _redact_transformed(source)
+            text = _redact_transformed(source, getattr(self._client, "_allowed_bot_ids", frozenset()))
         if not text.strip() and not files:
             if components is None:
                 return
@@ -1056,7 +1091,7 @@ class DiscordRenderer(Renderer):
             len(files),
         )
         try:
-            source = _redact_transformed(source)
+            source = _redact_transformed(source, getattr(self._client, "_allowed_bot_ids", frozenset()))
             recovery = [source]
             if len(source) > DISCORD_MAX_TEXT:
                 recovery = await asyncio.to_thread(split_markdown_safe, source, DISCORD_MAX_TEXT)
@@ -1109,7 +1144,7 @@ class DiscordRenderer(Renderer):
         self._thinking_posted = True
         # Redact BEFORE the preview cut: trimming first can leave a fragment the
         # credential matchers do not recognise.
-        body = _redact_transformed(reasoning)
+        body = _redact_transformed(reasoning, getattr(self._client, "_allowed_bot_ids", frozenset()))
         if len(body) > _THINKING_PREVIEW_CHARS:
             body = body[:_THINKING_PREVIEW_CHARS].rstrip() + "…"
         try:
