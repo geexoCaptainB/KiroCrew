@@ -3068,6 +3068,11 @@ def _build_discord_config(discord_data: dict) -> DiscordConfig:
         allowed_user_ids=_coerce_str_ids(discord_data.get("allowed_user_ids")),
         allowed_thread_ids=_coerce_str_ids(discord_data.get("allowed_thread_ids")),
         allowed_channel_ids=_coerce_str_ids(discord_data.get("allowed_channel_ids")),
+        # Snowflakes of OTHER bots allowed to start a turn (issue #55). Read
+        # explicitly here — a field the loader forgets silently reverts to the
+        # safe default ([]) on restart while the settings panel still shows the
+        # saved value, so the operator sees an allow-list the gateway ignores.
+        allowed_bot_ids=_coerce_str_ids(discord_data.get("allowed_bot_ids")),
         auto_thread=bool(discord_data.get("auto_thread", True)),
         require_mention=bool(discord_data.get("require_mention", False)),
         soft_threshold_pct=_threshold_pct(discord_data.get("soft_threshold_pct"), 80),

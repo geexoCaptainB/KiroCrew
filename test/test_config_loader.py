@@ -7091,3 +7091,29 @@ class TestMigrationWriteBackOrdering:
         assert wrote is False
         assert not Path(str(cfg_path) + ".bak").exists()
         assert json.loads(cfg_path.read_text(encoding="utf-8")) == already_migrated
+
+
+class TestDiscordAllowedBotIdsLoader:
+    """_build_discord_config must read allowed_bot_ids (issue #55).
+
+    Regression guard: a field the loader forgets silently reverts to [] on the
+    next restart while the settings panel still shows the saved value.
+    """
+
+    def test_allowed_bot_ids_round_trips_from_raw(self) -> None:
+        cfg = loader_module._build_discord_config(
+            {"allowed_bot_ids": ["1550948340970295447", "999"]}
+        )
+        assert list(cfg.allowed_bot_ids) == ["1550948340970295447", "999"]
+
+    def test_allowed_bot_ids_defaults_to_empty(self) -> None:
+        cfg = loader_module._build_discord_config({})
+        assert list(cfg.allowed_bot_ids) == []
+
+    def test_allowed_bot_ids_coerced_to_strings(self) -> None:
+        # Snowflakes exceed 2^53; they must survive as strings like
+        # allowed_user_ids, not be truncated as ints.
+        cfg = loader_module._build_discord_config(
+            {"allowed_bot_ids": [1550948340970295447]}
+        )
+        assert cfg.allowed_bot_ids == ["1550948340970295447"]
