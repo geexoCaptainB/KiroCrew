@@ -921,6 +921,14 @@ class DiscordRenderer(Renderer):
             text = body[: self._limit()]
         if not text or text == self._shown:
             return
+        if self._stream_mid is None and self._first_post_must_hold_for_bot_mention(text):
+            # issue #55: this is an inter-bot bridge message — the recipient bot
+            # gates admission on the MESSAGE_CREATE content and does NOT listen
+            # to edits. If the full answer mentions an allow-listed bot but this
+            # first frame (a throttled prefix) does not carry the token yet,
+            # hold the initial post so the CREATE lands WITH the mention rather
+            # than adding it via a later MESSAGE_UPDATE the peer never sees.
+            return
         self._last_edit = now
         self._shown = text
         if self._stream_mid is None:
@@ -929,6 +937,23 @@ class DiscordRenderer(Renderer):
                 self._stream_mid = mid
         else:
             await self._client.edit_message(self._channel_id, self._stream_mid, text)
+
+    def _first_post_must_hold_for_bot_mention(self, text: str) -> bool:
+        """True when the initial CREATE should wait: the full canonical answer
+        mentions an allow-listed bot but ``text`` (this streamed prefix) does not
+        carry that token yet (issue #55). Never holds once the token is present,
+        and never holds when there is no inter-bot mention pending, so a normal
+        human-directed stream is unaffected."""
+        allowed = getattr(self._client, "_allowed_bot_ids", frozenset())
+        if not allowed:
+            return False
+        canonical = "".join(self._buf)
+        pending = [
+            b for b in allowed
+            if (f"<@{b}>" in canonical or f"<@!{b}>" in canonical)
+            and (f"<@{b}>" not in text and f"<@!{b}>" not in text)
+        ]
+        return bool(pending)
 
     def authorize_upload_root(self, root: str) -> None:
         """Authorize the provider's resolved cwd; invalid roots disable uploads."""

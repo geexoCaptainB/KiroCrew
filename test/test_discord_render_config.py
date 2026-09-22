@@ -559,3 +559,74 @@ class TestMentionNeutralizationAllowlist:
         assert f"<@{self.HERMES}>" in out
         assert f"<@{self.ZWSP}999999999>" in out
         assert f"@{self.ZWSP}everyone" in out
+
+
+# ── issue #55 (stub+edit): first CREATE carries the inter-bot mention ────────
+
+
+class TestInterBotMentionInFirstPost:
+    """The initial MESSAGE_CREATE must carry the <@bot> token when the answer
+    mentions an allow-listed bot — the recipient gates on CREATE and ignores
+    edits, so a mention added later via MESSAGE_UPDATE never wakes it (#55)."""
+
+    HERMES = "1550948340970295447"
+
+    @pytest.mark.asyncio
+    async def test_first_post_held_until_mention_present(self) -> None:
+        renderer, client, clock = _renderer()
+        client._allowed_bot_ids = frozenset({self.HERMES})  # type: ignore[attr-defined]
+        await renderer.on_turn_start()
+
+        # The answer mentions Hermes but the token is further along than the
+        # first throttled frame shows. Simulate: buffer already holds the full
+        # text (mention at the end) but the visible prefix does not yet include
+        # it. The stub must be held so the CREATE lands WITH the token.
+        renderer._buf.append(f"dale, mirá el #57 <@{self.HERMES}>")  # type: ignore[attr-defined]
+        held = renderer._first_post_must_hold_for_bot_mention("dale, mirá el #57")  # type: ignore[attr-defined]
+        assert held is True, "must hold: buffer mentions the bot, prefix does not"
+
+        not_held = renderer._first_post_must_hold_for_bot_mention(  # type: ignore[attr-defined]
+            f"dale, mirá el #57 <@{self.HERMES}>"
+        )
+        assert not_held is False, "must NOT hold once the token is in the frame"
+        await renderer.close()
+
+    @pytest.mark.asyncio
+    async def test_no_allowlist_streams_normally(self) -> None:
+        # Without an allow-list, streaming is unchanged: the stub posts on the
+        # first frame even though no mention is present.
+        renderer, client, clock = _renderer()  # FakeClient has no _allowed_bot_ids
+        await renderer.on_turn_start()
+        await renderer.on_text_chunk("hola humano")
+        await _settle()
+        assert client.sent, "normal human stream must not be held"
+        await renderer.close()
+
+    @pytest.mark.asyncio
+    async def test_mention_still_delivered_at_seal_if_never_streamed_alone(self) -> None:
+        # Escape valve: even if the throttled frames never carry the token, the
+        # final seal posts the full content (with the mention) as a fresh CREATE.
+        renderer, client, clock = _renderer()
+        client._allowed_bot_ids = frozenset({self.HERMES})  # type: ignore[attr-defined]
+        await renderer.on_turn_start()
+        await renderer.on_text_chunk(f"<@{self.HERMES}> handoff")
+        await renderer.on_done()
+        await renderer.close()
+        # the mention reached the user somewhere (sent or sealed)
+        assert any(f"<@{self.HERMES}>" in t for t in client.texts), (
+            "the mention never reached Discord in any frame"
+        )
+
+    @pytest.mark.asyncio
+    async def test_mention_at_start_lands_in_first_create(self) -> None:
+        # Real case (issue #55 evidence): Kiro's message begins with <@id>.
+        # The first streamed frame already carries the token, so the CREATE
+        # lands with the mention and is not held.
+        renderer, client, clock = _renderer()
+        client._allowed_bot_ids = frozenset({self.HERMES})  # type: ignore[attr-defined]
+        await renderer.on_turn_start()
+        await renderer.on_text_chunk(f"<@{self.HERMES}> mirá el #57 review lista")
+        await _settle()
+        assert client.sent, "the first CREATE should have landed"
+        assert f"<@{self.HERMES}>" in client.sent[0][0]
+        await renderer.close()
