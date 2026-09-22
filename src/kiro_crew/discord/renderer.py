@@ -884,6 +884,14 @@ class DiscordRenderer(Renderer):
         bypasses the throttle so a tool-call event surfaces immediately."""
         if self._table_pending:
             return
+        if self._suppress_stream_for_bot_mention():
+            # issue #55: this turn mentions an allow-listed bot — it is an
+            # inter-bot bridge. The recipient bot gates admission on a single
+            # MESSAGE_CREATE and cannot know when a streamed message is done.
+            # Suppress live streaming entirely and let _seal_current post ONE
+            # complete message (mention included) at turn end, so the peer sees
+            # an atomic, final CREATE rather than a partial stub + edits.
+            return
         now = self._now()
         if not force and now - self._last_edit < _EDIT_THROTTLE_S:
             return
@@ -921,14 +929,6 @@ class DiscordRenderer(Renderer):
             text = body[: self._limit()]
         if not text or text == self._shown:
             return
-        if self._stream_mid is None and self._first_post_must_hold_for_bot_mention(text):
-            # issue #55: this is an inter-bot bridge message — the recipient bot
-            # gates admission on the MESSAGE_CREATE content and does NOT listen
-            # to edits. If the full answer mentions an allow-listed bot but this
-            # first frame (a throttled prefix) does not carry the token yet,
-            # hold the initial post so the CREATE lands WITH the mention rather
-            # than adding it via a later MESSAGE_UPDATE the peer never sees.
-            return
         self._last_edit = now
         self._shown = text
         if self._stream_mid is None:
@@ -938,22 +938,22 @@ class DiscordRenderer(Renderer):
         else:
             await self._client.edit_message(self._channel_id, self._stream_mid, text)
 
-    def _first_post_must_hold_for_bot_mention(self, text: str) -> bool:
-        """True when the initial CREATE should wait: the full canonical answer
-        mentions an allow-listed bot but ``text`` (this streamed prefix) does not
-        carry that token yet (issue #55). Never holds once the token is present,
-        and never holds when there is no inter-bot mention pending, so a normal
-        human-directed stream is unaffected."""
+    def _suppress_stream_for_bot_mention(self) -> bool:
+        """True when the current answer mentions an allow-listed bot (issue #55).
+
+        Such a message is an inter-agent bridge: the recipient bot gates
+        admission on a single MESSAGE_CREATE and has no way to know when a
+        streamed message stopped growing. So we suppress live streaming for the
+        whole turn and let the final seal post ONE complete message. With an
+        empty allowed_bot_ids (default) or a human-directed answer, this is
+        always False and streaming is unchanged."""
         allowed = getattr(self._client, "_allowed_bot_ids", frozenset())
         if not allowed:
             return False
         canonical = "".join(self._buf)
-        pending = [
-            b for b in allowed
-            if (f"<@{b}>" in canonical or f"<@!{b}>" in canonical)
-            and (f"<@{b}>" not in text and f"<@!{b}>" not in text)
-        ]
-        return bool(pending)
+        return any(
+            f"<@{b}>" in canonical or f"<@!{b}>" in canonical for b in allowed
+        )
 
     def authorize_upload_root(self, root: str) -> None:
         """Authorize the provider's resolved cwd; invalid roots disable uploads."""
