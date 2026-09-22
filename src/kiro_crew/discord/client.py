@@ -100,21 +100,49 @@ _MIN_HEALTHY_CONN_SECS = 5.0
 _NO_MENTIONS: dict[str, Any] = {"parse": []}
 
 
+def _mentions_payload(text: str, allowed_bot_ids: frozenset[str]) -> dict[str, Any]:
+    """Build ``allowed_mentions``: suppress everything EXCEPT allow-listed bot
+    ids that the text actually references (issue #55, outbound direction).
+
+    ``{"parse": []}`` is Discord's blanket suppression: an ``<@id>`` renders as
+    text but does not notify/wire the mention. That is the anti-mass-ping guard
+    and it stays for ``@everyone``/``@here``/roles/arbitrary users. For explicit
+    inter-agent comms we re-enable ONLY the allow-listed bot ids present in the
+    content, so Kiro→Hermes actually pings and wakes the peer's turn.
+
+    Empty ``allowed_bot_ids`` (default) returns the historical ``{"parse": []}``
+    unchanged — zero behavior change for installs without inter-bot.
+    """
+    if not allowed_bot_ids:
+        return _NO_MENTIONS
+    hit = [b for b in allowed_bot_ids if f"<@{b}>" in text or f"<@!{b}>" in text]
+    if not hit:
+        return _NO_MENTIONS
+    # parse:[] still suppresses @everyone/@here/roles; users re-enables ONLY the
+    # allow-listed bot ids the content references.
+    return {"parse": [], "users": hit}
+
+
 def _message_payload(
     text: str,
     components: list[dict] | None,
     *,
     keep_empty_components: bool,
+    allowed_bot_ids: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Build the JSON body shared by every message create/edit call.
 
     ``keep_empty_components`` distinguishes the two callers: an EDIT passes
     ``[]`` to retire a message's buttons, so an empty list must survive into the
     payload, while a CREATE treats empty as "no components" and omits the key.
+
+    ``allowed_bot_ids`` perforates the outbound mention suppression for exactly
+    those allow-listed bots the text references (issue #55); empty keeps the
+    historical blanket suppression.
     """
     payload: dict[str, Any] = {
         "content": text[:DISCORD_MAX_TEXT],
-        "allowed_mentions": _NO_MENTIONS,
+        "allowed_mentions": _mentions_payload(text[:DISCORD_MAX_TEXT], allowed_bot_ids),
     }
     include = components is not None if keep_empty_components else bool(components)
     if include:
@@ -123,14 +151,19 @@ def _message_payload(
 
 
 def _create_payload(
-    text: str, components: list[dict] | None, reply_to_message_id: str | None
+    text: str,
+    components: list[dict] | None,
+    reply_to_message_id: str | None,
+    allowed_bot_ids: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """The JSON body for a message CREATE, with or without attachments.
 
     ``fail_if_not_exists: False`` keeps a reply to a message the user deleted
     mid-turn from failing the whole send; it lands unthreaded instead.
     """
-    payload = _message_payload(text, components, keep_empty_components=False)
+    payload = _message_payload(
+        text, components, keep_empty_components=False, allowed_bot_ids=allowed_bot_ids
+    )
     if reply_to_message_id:
         payload["message_reference"] = {
             "message_id": reply_to_message_id,
@@ -684,7 +717,9 @@ class DiscordClient:
         result = await self._api(
             "POST",
             f"/channels/{channel_id}/messages",
-            _create_payload(text, components, reply_to_message_id),
+            _create_payload(
+                text, components, reply_to_message_id, self._allowed_bot_ids
+            ),
         )
         return str(result.get("id")) if result else None
 
@@ -704,7 +739,9 @@ class DiscordClient:
         ``result.outcome`` says whether a failure is worth another attempt.
         Attachments switch the same call to multipart, so one verb covers both.
         """
-        payload = _create_payload(text, components, reply_to_message_id)
+        payload = _create_payload(
+            text, components, reply_to_message_id, self._allowed_bot_ids
+        )
         path = f"/channels/{channel_id}/messages"
         if files:
             return await self.api_files("POST", path, payload, files)
@@ -726,7 +763,10 @@ class DiscordClient:
         permanently (the message was deleted) must stop the stream rather than
         be retried, which a bare ``False`` cannot express.
         """
-        payload = _message_payload(text, components, keep_empty_components=True)
+        payload = _message_payload(
+            text, components, keep_empty_components=True,
+            allowed_bot_ids=self._allowed_bot_ids,
+        )
         path = f"/channels/{channel_id}/messages/{message_id}"
         if files:
             return await self.api_files("PATCH", path, payload, files)
@@ -757,7 +797,10 @@ class DiscordClient:
         components: list[dict] | None = None,
     ) -> bool:
         """Edit an existing message in-place (for streaming)."""
-        payload = _message_payload(text, components, keep_empty_components=True)
+        payload = _message_payload(
+            text, components, keep_empty_components=True,
+            allowed_bot_ids=self._allowed_bot_ids,
+        )
         result = await self._api("PATCH", f"/channels/{channel_id}/messages/{message_id}", payload)
         return result is not None
 
@@ -781,7 +824,9 @@ class DiscordClient:
         result = await self._api_multipart(
             "POST",
             f"/channels/{channel_id}/messages",
-            _create_payload(text, components, reply_to_message_id),
+            _create_payload(
+                text, components, reply_to_message_id, self._allowed_bot_ids
+            ),
             files,
         )
         return str(result.get("id", "")) if result is not None else None
@@ -841,7 +886,10 @@ class DiscordClient:
         """Edit a streamed message and replace its attachments with ``files``."""
         if not files:
             return await self.edit_message(channel_id, message_id, text, components=components)
-        payload = _message_payload(text, components, keep_empty_components=True)
+        payload = _message_payload(
+            text, components, keep_empty_components=True,
+            allowed_bot_ids=self._allowed_bot_ids,
+        )
         result = await self._api_multipart(
             "PATCH", f"/channels/{channel_id}/messages/{message_id}", payload, files
         )

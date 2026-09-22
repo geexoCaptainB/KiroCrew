@@ -1709,3 +1709,71 @@ class TestEphemeralInteractionResponse:
         assert seen[0][1]["type"] == 4
         assert seen[0][1]["data"]["flags"] == 64
         assert "flags" not in seen[1][1]["data"]
+
+
+# ── issue #55 (outbound): allow-listed bot mentions pierce parse:[] ──────────
+
+
+class TestOutboundBotMentionAllowlist:
+    """_mentions_payload re-enables ONLY allow-listed bot ids the text mentions;
+    everything else stays suppressed (issue #55, Kiro->Hermes direction)."""
+
+    HERMES = "1550948340970295447"
+
+    def test_empty_allowlist_keeps_blanket_suppression(self) -> None:
+        assert dc._mentions_payload(f"hi <@{self.HERMES}>", frozenset()) == {"parse": []}
+
+    def test_allowlisted_bot_mentioned_is_re_enabled(self) -> None:
+        out = dc._mentions_payload(f"<@{self.HERMES}> ping", frozenset({self.HERMES}))
+        assert out == {"parse": [], "users": [self.HERMES]}
+
+    def test_bang_form_mention_matches(self) -> None:
+        out = dc._mentions_payload(f"<@!{self.HERMES}> ping", frozenset({self.HERMES}))
+        assert out == {"parse": [], "users": [self.HERMES]}
+
+    def test_allowlisted_but_not_mentioned_stays_suppressed(self) -> None:
+        # allow-list set, but the text does not reference the bot -> no ping.
+        assert dc._mentions_payload("plain text", frozenset({self.HERMES})) == {"parse": []}
+
+    def test_everyone_and_roles_never_re_enabled(self) -> None:
+        # Even with an allow-list, @everyone/@here/roles stay suppressed: only
+        # the explicit user ids appear under "users", parse stays [].
+        out = dc._mentions_payload(
+            f"@everyone <@&999> <@{self.HERMES}>", frozenset({self.HERMES})
+        )
+        assert out == {"parse": [], "users": [self.HERMES]}
+
+    def test_non_allowlisted_bot_mention_stays_suppressed(self) -> None:
+        # A different bot id in the text, not in the allow-list -> suppressed.
+        out = dc._mentions_payload("<@111111111111111111> hi", frozenset({self.HERMES}))
+        assert out == {"parse": []}
+
+    @pytest.mark.asyncio
+    async def test_send_wires_the_allowlisted_mention_end_to_end(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _make_client(allowed_bot_ids=[self.HERMES])
+        seen = self._payloads(monkeypatch, client)
+        await client.send_message("c1", f"<@{self.HERMES}> tomá el turno")
+        assert seen[0]["allowed_mentions"] == {"parse": [], "users": [self.HERMES]}
+        # content is untouched
+        assert seen[0]["content"] == f"<@{self.HERMES}> tomá el turno"
+
+    @pytest.mark.asyncio
+    async def test_send_without_mention_stays_suppressed_even_with_allowlist(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _make_client(allowed_bot_ids=[self.HERMES])
+        seen = self._payloads(monkeypatch, client)
+        await client.send_message("c1", "sin mención")
+        assert seen[0]["allowed_mentions"] == {"parse": []}
+
+    def _payloads(self, monkeypatch: pytest.MonkeyPatch, client: Any) -> list[Any]:
+        seen: list[Any] = []
+
+        async def _api(method: str, path: str, payload: Any, timeout: int = 30) -> Any:
+            seen.append(payload)
+            return {"id": 1}
+
+        monkeypatch.setattr(client, "_api", _api)
+        return seen
