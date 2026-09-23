@@ -1015,7 +1015,12 @@ class DiscordRenderer(Renderer):
             # carries the mention. Only triggers on inter-bot messages; normal
             # human streaming keeps the edit-in-place path below.
             if self._stream_mid is not None and self._mentions_allowed_bot(text):
-                await self._client.delete_message(self._channel_id, self._stream_mid)
+                try:
+                    await self._client.delete_message(self._channel_id, self._stream_mid)
+                except Exception:
+                    # A failed delete must not sink the turn: fall through and
+                    # still post the fresh CREATE (worst case leaves the stub).
+                    logger.warning("discord: stub delete failed; reposting anyway", exc_info=True)
                 self._stream_mid = None
             if self._stream_mid is not None:
                 if await self._client.edit_message_with_files(

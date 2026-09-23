@@ -1777,3 +1777,36 @@ class TestOutboundBotMentionAllowlist:
 
         monkeypatch.setattr(client, "_api", _api)
         return seen
+
+
+class TestDeleteMessage:
+    """delete_message must call _api with the full (method, path, payload)
+    signature — a missing payload arg raised TypeError in prod (issue #55)."""
+
+    @pytest.mark.asyncio
+    async def test_delete_message_calls_api_with_payload_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _make_client()
+        calls: list[tuple] = []
+
+        async def _api(method: str, path: str, payload: Any, timeout: int = 30) -> Any:
+            calls.append((method, path, payload))
+            return {}
+
+        monkeypatch.setattr(client, "_api", _api)
+        ok = await client.delete_message("c1", "m1")
+        assert ok is True
+        assert calls == [("DELETE", "/channels/c1/messages/m1", None)]
+
+    @pytest.mark.asyncio
+    async def test_delete_message_returns_false_on_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _make_client()
+
+        async def _api(method: str, path: str, payload: Any, timeout: int = 30) -> Any:
+            return None
+
+        monkeypatch.setattr(client, "_api", _api)
+        assert await client.delete_message("c1", "m1") is False

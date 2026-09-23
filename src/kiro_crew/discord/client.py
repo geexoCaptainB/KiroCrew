@@ -727,7 +727,7 @@ class DiscordClient:
         """Delete a message. Returns True on success. Used to replace a streamed
         stub with a single atomic CREATE for inter-bot bridges (issue #55)."""
         result = await self._api(
-            "DELETE", f"/channels/{channel_id}/messages/{message_id}"
+            "DELETE", f"/channels/{channel_id}/messages/{message_id}", None
         )
         return result is not None
 
