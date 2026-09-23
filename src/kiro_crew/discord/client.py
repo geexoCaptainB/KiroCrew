@@ -723,6 +723,14 @@ class DiscordClient:
         )
         return str(result.get("id")) if result else None
 
+    async def delete_message(self, channel_id: str, message_id: str) -> bool:
+        """Delete a message. Returns True on success. Used to replace a streamed
+        stub with a single atomic CREATE for inter-bot bridges (issue #55)."""
+        result = await self._api(
+            "DELETE", f"/channels/{channel_id}/messages/{message_id}"
+        )
+        return result is not None
+
     async def send_message_result(
         self,
         channel_id: str,

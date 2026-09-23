@@ -884,14 +884,6 @@ class DiscordRenderer(Renderer):
         bypasses the throttle so a tool-call event surfaces immediately."""
         if self._table_pending:
             return
-        if self._suppress_stream_for_bot_mention():
-            # issue #55: this turn mentions an allow-listed bot — it is an
-            # inter-bot bridge. The recipient bot gates admission on a single
-            # MESSAGE_CREATE and cannot know when a streamed message is done.
-            # Suppress live streaming entirely and let _seal_current post ONE
-            # complete message (mention included) at turn end, so the peer sees
-            # an atomic, final CREATE rather than a partial stub + edits.
-            return
         now = self._now()
         if not force and now - self._last_edit < _EDIT_THROTTLE_S:
             return
@@ -938,21 +930,14 @@ class DiscordRenderer(Renderer):
         else:
             await self._client.edit_message(self._channel_id, self._stream_mid, text)
 
-    def _suppress_stream_for_bot_mention(self) -> bool:
-        """True when the current answer mentions an allow-listed bot (issue #55).
-
-        Such a message is an inter-agent bridge: the recipient bot gates
-        admission on a single MESSAGE_CREATE and has no way to know when a
-        streamed message stopped growing. So we suppress live streaming for the
-        whole turn and let the final seal post ONE complete message. With an
-        empty allowed_bot_ids (default) or a human-directed answer, this is
-        always False and streaming is unchanged."""
+    def _mentions_allowed_bot(self, text: str) -> bool:
+        """True when ``text`` mentions an allow-listed bot (issue #55). Used to
+        decide whether a sealed message must land as a fresh atomic CREATE so an
+        inter-bot recipient (which gates admission on the CREATE, not on edits)
+        actually sees the mention. Empty allowed_bot_ids => always False."""
         allowed = getattr(self._client, "_allowed_bot_ids", frozenset())
-        if not allowed:
-            return False
-        canonical = "".join(self._buf)
         return any(
-            f"<@{b}>" in canonical or f"<@!{b}>" in canonical for b in allowed
+            f"<@{b}>" in text or f"<@!{b}>" in text for b in allowed
         )
 
     def authorize_upload_root(self, root: str) -> None:
@@ -1022,6 +1007,16 @@ class DiscordRenderer(Renderer):
         """Edit first, then send; fail softly so recovery can restore markup."""
         self._seals_attempted += 1
         try:
+            # issue #55: for an inter-bot bridge (the sealed text mentions an
+            # allow-listed bot), the recipient gates admission on the
+            # MESSAGE_CREATE, not on edits. A streamed stub was created without
+            # the mention (it streamed in later), so editing it never wakes the
+            # peer. Delete the stub and post ONE fresh, complete CREATE that
+            # carries the mention. Only triggers on inter-bot messages; normal
+            # human streaming keeps the edit-in-place path below.
+            if self._stream_mid is not None and self._mentions_allowed_bot(text):
+                await self._client.delete_message(self._channel_id, self._stream_mid)
+                self._stream_mid = None
             if self._stream_mid is not None:
                 if await self._client.edit_message_with_files(
                     self._channel_id, self._stream_mid, text, files, components=components

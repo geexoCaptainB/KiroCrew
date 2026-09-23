@@ -43,6 +43,7 @@ class FakeClient:
     def __init__(self, *, api_ok: bool = True) -> None:
         self.sent: list[tuple[str, Any]] = []
         self.edits: list[tuple[str, str, Any]] = []
+        self.deleted: list[str] = []
         self.sealed: list[str] = []
         self.api_calls: list[tuple[str, str]] = []
         self.api_ok = api_ok
@@ -67,6 +68,10 @@ class FakeClient:
         self, channel_id: str, message_id: str, text: str, *, components: Any = None
     ) -> bool:
         self.edits.append((message_id, text, components))
+        return True
+
+    async def delete_message(self, channel_id: str, message_id: str) -> bool:
+        self.deleted.append(message_id)
         return True
 
     async def edit_message_with_files(
@@ -561,61 +566,64 @@ class TestMentionNeutralizationAllowlist:
         assert f"@{self.ZWSP}everyone" in out
 
 
-# ── issue #55 (stub+edit): inter-bot messages post ONE atomic CREATE ─────────
+# ── issue #55: inter-bot messages re-post as one atomic CREATE at seal ───────
 
 
-class TestInterBotStreamSuppression:
-    """A message mentioning an allow-listed bot must NOT stream (stub+edit):
-    the recipient gates on a single MESSAGE_CREATE and cannot tell when a
-    streamed message is done. It is posted whole, once, at the seal (#55)."""
+class TestInterBotAtomicRepost:
+    """A streamed message whose final text mentions an allow-listed bot must be
+    re-posted as ONE fresh CREATE at seal (delete the stub, send whole), because
+    the recipient bot gates admission on the CREATE and ignores edits (#55).
+    The mention often streams in AFTER the stub was created, so editing the stub
+    never wakes the peer."""
 
     HERMES = "1550948340970295447"
 
     @pytest.mark.asyncio
-    async def test_inter_bot_message_does_not_stream(self) -> None:
+    async def test_stub_deleted_and_reposted_when_mention_streams_in_late(self) -> None:
         renderer, client, clock = _renderer()
         client._allowed_bot_ids = frozenset({self.HERMES})  # type: ignore[attr-defined]
         await renderer.on_turn_start()
-        # Multiple chunks that would normally each trigger a live edit.
-        await renderer.on_text_chunk(f"<@{self.HERMES}> mirá el #57")
-        clock.t += 10
-        await renderer.on_text_chunk(" — review lista, cuando puedas")
+        # First frame: no mention yet -> a normal stub is created (streaming).
+        await renderer.on_text_chunk("Dale, va el ping de prueba")
         await _settle()
-        # Nothing streamed live: no live sends, no edits during the turn.
-        assert client.sent == [], "inter-bot message must not post a live stub"
-        assert client.edits == [], "inter-bot message must not stream via edits"
-        await renderer.close()
-
-    @pytest.mark.asyncio
-    async def test_inter_bot_message_posted_whole_at_seal(self) -> None:
-        renderer, client, clock = _renderer()
-        client._allowed_bot_ids = frozenset({self.HERMES})  # type: ignore[attr-defined]
-        await renderer.on_turn_start()
-        await renderer.on_text_chunk(f"<@{self.HERMES}> mirá el #57")
-        await renderer.on_text_chunk(" review lista")
+        assert client.sent, "the streaming stub should have been created"
+        stub_id = str(client._mid)  # last id handed out
+        # The mention streams in later, then the turn ends.
+        clock.t += 10
+        await renderer.on_text_chunk(f" <@{self.HERMES}> mirá el #57")
         await renderer.on_done()
         await renderer.close()
-        # One complete message, mention included, landed at the seal.
-        landed = [t for t in client.texts if f"<@{self.HERMES}>" in t]
-        assert landed, "the complete inter-bot message never landed"
-        assert "review lista" in landed[-1], "the message was not complete"
+        # The stub was deleted and a fresh message posted with the mention.
+        assert stub_id in client.deleted, "the stub must be deleted before repost"
+        assert any(f"<@{self.HERMES}>" in t for t in client.sealed), (
+            "the atomic repost must carry the mention"
+        )
 
     @pytest.mark.asyncio
-    async def test_human_message_still_streams(self) -> None:
-        # No allow-list => normal streaming preserved (live send on first frame).
+    async def test_human_message_edits_in_place_no_delete(self) -> None:
+        # No mention to a bot -> normal edit-in-place seal, no delete/repost.
         renderer, client, clock = _renderer()
+        client._allowed_bot_ids = frozenset({self.HERMES})  # type: ignore[attr-defined]
         await renderer.on_turn_start()
-        await renderer.on_text_chunk("hola humano, ya te paso")
+        await renderer.on_text_chunk("respuesta para un humano")
         await _settle()
-        assert client.sent, "human-directed stream must still post live"
+        await renderer.on_done()
         await renderer.close()
+        assert client.deleted == [], "a human message must not delete/repost"
 
     @pytest.mark.asyncio
-    async def test_suppress_predicate(self) -> None:
+    async def test_no_allowlist_never_reposts(self) -> None:
+        renderer, client, clock = _renderer()  # FakeClient has no _allowed_bot_ids
+        await renderer.on_turn_start()
+        await renderer.on_text_chunk(f"<@{self.HERMES}> hola")
+        await _settle()
+        await renderer.on_done()
+        await renderer.close()
+        assert client.deleted == [], "without an allow-list nothing is reposted"
+
+    def test_mentions_allowed_bot_predicate(self) -> None:
         renderer, client, _ = _renderer()
         client._allowed_bot_ids = frozenset({self.HERMES})  # type: ignore[attr-defined]
-        renderer._buf.append(f"hola <@{self.HERMES}>")  # type: ignore[attr-defined]
-        assert renderer._suppress_stream_for_bot_mention() is True  # type: ignore[attr-defined]
-        renderer._buf.clear()  # type: ignore[attr-defined]
-        renderer._buf.append("hola humano")  # type: ignore[attr-defined]
-        assert renderer._suppress_stream_for_bot_mention() is False  # type: ignore[attr-defined]
+        assert renderer._mentions_allowed_bot(f"hi <@{self.HERMES}>") is True  # type: ignore[attr-defined]
+        assert renderer._mentions_allowed_bot(f"hi <@!{self.HERMES}>") is True  # type: ignore[attr-defined]
+        assert renderer._mentions_allowed_bot("hi human") is False  # type: ignore[attr-defined]
